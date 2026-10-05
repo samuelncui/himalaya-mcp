@@ -24,7 +24,7 @@ Pin an available release in your MCP client:
       "command": "npx",
       "args": [
         "--yes",
-        "himalaya-mcp@2.2.1-adapter.0.1.3",
+        "himalaya-mcp@2.2.1-adapter.0.1.4",
         "serve",
         "--config",
         "/absolute/path/to/config.toml",
@@ -60,7 +60,7 @@ The endpoint is `http://127.0.0.1:3000/mcp`. HTTP has Host/Origin checks, **no b
 
 The MCP server provides common file and send-verification instructions during initialization, separate from automatically exported native Help. Clients should apply those instructions together with each tool schema.
 
-Every native call requires a unique, stable `request_id`. The server saves an operation receipt before execution; a slow call returns its ID after approximately two seconds while execution continues. Use `himalaya_mcp_operation_status` or `himalaya_mcp_operations_list` after a lost response. Identical requests reuse the retained receipt rather than executing again; changed inputs under the same ID are rejected. Deduplication is bounded by history retention (up to 24 hours / 128 records). Missing history, interrupted results, or `unknown` never justify automatic resending. Native exit 0 confirms completion or backend acceptance for sending, not recipient delivery.
+Every native call requires a unique, stable `request_id`. The server saves an operation receipt before execution; a slow call returns its ID after approximately two seconds while execution continues. After a lost response, query `himalaya_mcp_operation_status` with the original `request_id` or returned `operation.id`; prefer `include_result=false` for completion checks without large output. Use `himalaya_mcp_operations_list` if neither identifier is available. Identical requests reuse the retained receipt rather than executing again; changed inputs under the same ID are rejected. Deduplication is bounded by history retention (up to 24 hours / 128 records). Missing history, interrupted results, or `unknown` never justify automatic resending. Native exit 0 confirms completion or backend acceptance for sending, not recipient delivery.
 
 `--operation-dir` selects private persistent metadata; raw inputs, URLs, and email content are not saved. Full output is temporary in-memory data. Use one directory per live server, including separate diagnostic instances. A live PID owner blocks concurrent startup; recovered incomplete operations remain `unknown` without replay. See [the operation and file contract](docs/usage.md).
 

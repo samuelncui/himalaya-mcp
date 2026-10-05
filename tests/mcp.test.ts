@@ -136,6 +136,9 @@ test('initialization shares stable guidance for files, interrupted operations an
   for (const fact of [
     'openai/fileParams',
     'himalaya_mcp_operation_status',
+    'original request_id',
+    'include_result=false',
+    'querying never executes',
     'Sent verification',
     'after D excludes D',
     'not delivery to the recipient',
