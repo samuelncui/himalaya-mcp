@@ -111,5 +111,33 @@
       "action": "unknown"
     },
     "errorKind": "InvalidValue"
+  },
+  {
+    "name": "ordinary mailbox beginning with a hyphen",
+    "path": ["imap", "create"],
+    "params": {
+      "mailbox_name": "-Projects"
+    }
+  },
+  {
+    "name": "two ordinary option-like mailboxes",
+    "path": ["imap", "rename"],
+    "params": {
+      "mailbox_name": "-Old",
+      "target_mailbox_name": "-New"
+    }
+  },
+  {
+    "name": "literal option-like message ID remains positional",
+    "path": ["message", "read"],
+    "params": {
+      "id": "--account=intruder"
+    }
+  },
+  {
+    "name": "native required field remains authoritative",
+    "path": ["smtp", "send"],
+    "params": {},
+    "errorKind": "MissingRequiredArgument"
   }
 ]

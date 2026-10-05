@@ -31,6 +31,28 @@ test('fixed command path, repeated values, equals binding, and no shell interpol
   assert.throws(() => serialize(cmd, { argv: ['delete'] }), /Unknown parameter/);
 });
 
+test('ordinary positionals preserve option-like values after the delimiter', () => {
+  const cmd = command([
+    argument('account', {}),
+    argument('mailbox', { long: null, index: 1 }),
+    argument('target', { long: null, index: 2 }),
+  ]);
+  assert.deepEqual(
+    serialize(cmd, { account: 'selected', mailbox: '-Projects', target: '--account=intruder' }),
+    ['synthetic', '--account=selected', '--', '-Projects', '--account=intruder'],
+  );
+  const ids = command([
+    argument('id', { long: null, index: 1, action: 'Append', maxValues: null }),
+  ]);
+  assert.deepEqual(serialize(ids, { id: ['-one', '--', '--account=intruder'] }), [
+    'synthetic',
+    '--',
+    '-one',
+    '--',
+    '--account=intruder',
+  ]);
+});
+
 test('ordinary positionals precede greedy options when last/raw owns --', () => {
   const cmd = command(
     [
@@ -54,6 +76,10 @@ test('ordinary positionals precede greedy options when last/raw owns --', () => 
       'message-raw': ['Subject: test\n\nbody'],
     }),
     ['imap', 'append', 'Drafts', '--flag=Seen', '--', 'Subject: test\n\nbody'],
+  );
+  assert.throws(
+    () => serialize(cmd, { mailbox: '--account=intruder', 'message-raw': ['body'] }),
+    /does not permit values beginning with '-'/,
   );
   const schema = buildTools(catalog([cmd]), profiles)[0]!.inputSchema.properties.params as {
     properties: Record<string, { items?: { type?: string } }>;

@@ -20,6 +20,8 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.repository == 'samuelncui/himalaya-mcp'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      artifact-id: ${{ steps.definitions.outputs.artifact-id }}
     env:
       NODE_OPTIONS: --use-system-ca
       UPSTREAM_VERSION: ${{ inputs.version }}
@@ -31,8 +33,10 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: '24'
+          node-version: '24.21.0'
           package-manager-cache: false
+      - name: Pin the validated npm pack toolchain
+        run: npm install --global npm@11.19.0 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
       - name: Install build tools for source reflection only
         run: |
           sudo apt-get update
@@ -47,9 +51,10 @@ jobs:
       - run: npm run verify:native
       - run: node scripts/release.mjs check-source
       - name: Export data-only definitions and original source evidence
+        id: definitions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-definitions
+          name: release-definitions-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 30
           path: |
@@ -66,7 +71,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-failure-reports
+          name: release-failure-reports-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 30
           path: |
@@ -88,13 +93,16 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: '24'
+          node-version: '24.21.0'
           package-manager-cache: false
+      - name: Pin the validated npm pack toolchain
+        run: npm install --global npm@11.19.0 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: release-definitions
+          artifact-ids: ${{ needs.generation.outputs.artifact-id }}
           path: build
+          merge-multiple: true
       - name: Validate reviewed JS in a fresh VM
         run: npm run check
       - run: npm run build
@@ -104,7 +112,7 @@ jobs:
         id: seal
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-candidate
+          name: release-candidate-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 30
           path: |

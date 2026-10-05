@@ -2,7 +2,7 @@
   "mcpServers": {
     "email": {
       "command": "npx",
-      "args": ["--yes", "himalaya-mcp@2.2.1-adapter.0.1.0"]
+      "args": ["--yes", "himalaya-mcp@2.2.1-adapter.0.1.1"]
     }
   }
 }

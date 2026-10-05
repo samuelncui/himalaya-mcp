@@ -91,6 +91,7 @@ export interface Profiles {
     destructive?: boolean;
     interactive?: boolean;
     args?: Record<string, IoRole>;
+    pathExpansion?: Record<string, 'shell'>;
   }[];
 }
 
