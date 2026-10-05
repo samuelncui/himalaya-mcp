@@ -24,7 +24,7 @@ Pin an available release in your MCP client:
       "command": "npx",
       "args": [
         "--yes",
-        "himalaya-mcp@2.2.1-adapter.0.1.1",
+        "himalaya-mcp@2.2.1-adapter.0.1.2",
         "serve",
         "--config",
         "/absolute/path/to/config.toml"

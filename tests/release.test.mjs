@@ -14,36 +14,130 @@ import {
 
 const root = resolve(import.meta.dirname, '..');
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+const publicArchive = Buffer.from('Synthetic release archive.');
 
 const lock = {
   repository: 'fixture/adapter',
   package: { name: 'synthetic-adapter', version: '2.2.1-adapter.0.1.1' },
   upstream: { version: '2.2.1' },
   adapter: { revision: '1'.repeat(40) },
-  artifact: { integrity: 'sha512-synthetic-integrity' },
+  artifact: { integrity: 'sha512-' + createHash('sha512').update(publicArchive).digest('base64') },
 };
+const registryEntry = {
+  version: lock.package.version,
+  dist: {
+    integrity: lock.artifact.integrity,
+    tarball: 'https://registry.npmjs.org/synthetic-adapter/-/synthetic-adapter.tgz',
+  },
+};
+const archiveOptions = { readArchive: async () => publicArchive };
 
 test('publication acceptance checks integrity and both authoritative npm tags', async () => {
-  const read = async (url) => ({
-    version: lock.package.version,
-    dist: { integrity: lock.artifact.integrity },
-    ...(url.endsWith('/latest') ? { tag: 'latest' } : {}),
-  });
-  await verifyRegistryPublication(lock, read);
+  const read = async () => registryEntry;
+  await verifyRegistryPublication(lock, read, archiveOptions);
   for (const tag of ['latest', 'himalaya-2.2.1'])
     await assert.rejects(
-      verifyRegistryPublication(lock, async (url) =>
-        url.endsWith('/' + tag) ? { version: '2.2.0-adapter.0.1.0' } : read(url),
+      verifyRegistryPublication(
+        lock,
+        async (url) => (url.endsWith('/' + tag) ? { version: '2.2.0-adapter.0.1.0' } : read(url)),
+        archiveOptions,
       ),
-      /tags do not select/,
+      /tags do not yet select/,
     );
   await assert.rejects(
     verifyRegistryPublication(lock, async (url) => ({
       ...(await read(url)),
       dist: { integrity: 'different' },
     })),
-    /integrity has not been verified/,
+    /integrity differs/,
   );
+});
+
+test('publication waits for version, tags and archive visibility without repeating a write', async () => {
+  for (const pending of ['version', 'latest', 'native', 'archive']) {
+    let time = 0;
+    const sleeps = [];
+    const read = async (url) => {
+      if (!time && pending === 'version' && url.endsWith(lock.package.version)) return undefined;
+      if (
+        !time &&
+        ((pending === 'latest' && url.endsWith('/latest')) ||
+          (pending === 'native' && url.endsWith('/himalaya-2.2.1')))
+      )
+        return { version: '2.2.0-adapter.0.1.0' };
+      return registryEntry;
+    };
+    await verifyRegistryPublication(lock, read, {
+      timeoutMs: 50,
+      intervalMs: 10,
+      now: () => time,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        time += ms;
+      },
+      readArchive: async () => (!time && pending === 'archive' ? undefined : publicArchive),
+    });
+    assert.deepEqual(sleeps, [10], pending);
+  }
+});
+
+test('publication mismatches, untrusted archives and read errors fail without waiting', async () => {
+  const failOnSleep = async () => assert.fail('This error must not be retried');
+  const options = { timeoutMs: 50, sleep: failOnSleep, ...archiveOptions };
+  await assert.rejects(
+    verifyRegistryPublication(
+      lock,
+      async () => ({ ...registryEntry, dist: { integrity: 'wrong' } }),
+      options,
+    ),
+    /registry integrity differs/,
+  );
+  await assert.rejects(
+    verifyRegistryPublication(lock, async () => registryEntry, {
+      ...options,
+      readArchive: async () => Buffer.from('different bytes'),
+    }),
+    /archive integrity differs/,
+  );
+  await assert.rejects(
+    verifyRegistryPublication(
+      lock,
+      async () => ({
+        ...registryEntry,
+        dist: { ...registryEntry.dist, tarball: 'https://untrusted.example/archive.tgz' },
+      }),
+      options,
+    ),
+    /official HTTPS/,
+  );
+  await assert.rejects(
+    verifyRegistryPublication(
+      lock,
+      async () => {
+        throw new Error('HTTP 403');
+      },
+      options,
+    ),
+    /HTTP 403/,
+  );
+});
+
+test('publication visibility timeout preserves the sealed artifact recovery instructions', async () => {
+  let time = 0;
+  const sleeps = [];
+  await assert.rejects(
+    verifyRegistryPublication(lock, async () => undefined, {
+      timeoutMs: 50,
+      intervalMs: 30,
+      now: () => time,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        time += ms;
+      },
+    }),
+    /rerun the original failed job with its sealed artifact/,
+  );
+  assert.deepEqual(sleeps, [30, 20]);
 });
 
 test('release acceptance resolves lightweight and annotated Git tags to the sealed commit', async () => {
@@ -187,6 +281,7 @@ test('workflow reruns preserve immutable uploads and consume sealed IDs across a
     if (workflow.jobs.publish) {
       assert(workflow.jobs.publish.steps.some((step) => step.run?.includes('npm@11.21.0')));
       assert.equal(workflow.jobs.publish.permissions['id-token'], 'write');
+      assert.equal(workflow.jobs.publish['timeout-minutes'], 30);
     }
     assert.notEqual(generation.permissions?.['id-token'], 'write');
     assert.notEqual(packageJob.permissions?.['id-token'], 'write');

@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import * as tls from 'node:tls';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import { gunzipSync } from 'node:zlib';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -497,7 +498,7 @@ function assertTrustedWorkflow(lock, oidc = false) {
     );
 }
 
-async function getJson(url, github = false) {
+export async function getJson(url, github = false) {
   if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0')
     throw new Error('TLS verification must remain enabled.');
   if (
@@ -517,22 +518,86 @@ async function getJson(url, github = false) {
   return response.json();
 }
 
-/** Registry version identity and both moving tags are separate publication facts. */
-export async function verifyRegistryPublication(lock, read = getJson) {
+async function registryArchive(url) {
+  const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(30_000) });
+  if (response.status === 404) return undefined;
+  if (!response.ok)
+    throw new Error('Published archive request failed with HTTP ' + response.status + '.');
+  const limit = 32 * 1024 * 1024;
+  if (Number(response.headers.get('content-length')) > limit || !response.body)
+    throw new Error('Published archive is missing or exceeds 32 MiB.');
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.body) {
+    size += chunk.length;
+    if (size > limit) throw new Error('Published archive exceeds 32 MiB.');
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks, size);
+}
+
+/** Wait only for public visibility; never repeat npm publish or accept different bytes. */
+export async function verifyRegistryPublication(
+  lock,
+  read = getJson,
+  {
+    timeoutMs = 0,
+    intervalMs = 15_000,
+    now = Date.now,
+    sleep = delay,
+    readArchive = registryArchive,
+  } = {},
+) {
   const base = 'https://registry.npmjs.org/' + encodeURIComponent(lock.package.name) + '/';
-  const [published, latest, native] = await Promise.all([
-    read(base + encodeURIComponent(lock.package.version)),
-    read(base + 'latest'),
-    read(base + 'himalaya-' + lock.upstream.version),
-  ]);
-  if (published?.dist?.integrity !== lock.artifact.integrity)
-    throw new Error(
-      'Published registry integrity has not been verified; rerun this workflow before declaring release complete.',
-    );
-  if (latest?.version !== lock.package.version || native?.version !== lock.package.version)
-    throw new Error(
-      'Published npm tags do not select the sealed version; rerun this workflow before declaring release complete.',
-    );
+  const deadline = now() + timeoutMs;
+  let waiting = false;
+  for (;;) {
+    const [published, latest, native] = await Promise.all([
+      read(base + encodeURIComponent(lock.package.version)),
+      read(base + 'latest'),
+      read(base + 'himalaya-' + lock.upstream.version),
+    ]);
+    if (published && published.dist?.integrity !== lock.artifact.integrity)
+      throw new Error('Published registry integrity differs from the sealed archive.');
+    let pending = 'Published npm metadata or tags do not yet select the sealed version';
+    if (
+      published &&
+      latest?.version === lock.package.version &&
+      native?.version === lock.package.version
+    ) {
+      const url = new URL(published.dist.tarball);
+      if (
+        url.origin !== 'https://registry.npmjs.org' ||
+        url.username ||
+        url.password ||
+        url.hash ||
+        url.search
+      )
+        throw new Error('Published archive must come from the official HTTPS npm registry.');
+      const archive = await readArchive(url.href);
+      if (archive !== undefined) {
+        const integrity = 'sha512-' + createHash('sha512').update(archive).digest('base64');
+        if (integrity !== lock.artifact.integrity)
+          throw new Error('Public npm archive integrity differs from the sealed archive.');
+        return;
+      }
+      pending = 'Published npm archive is not yet publicly downloadable';
+    }
+    const remaining = deadline - now();
+    if (remaining <= 0)
+      throw new Error(
+        pending +
+          '. Upload may still be under npm review. Wait for visibility, then rerun the original failed job with its sealed artifact; do not repack or repeat publication manually.',
+      );
+    if (!waiting)
+      console.log(
+        'Waiting up to ' +
+          Math.ceil(timeoutMs / 60_000) +
+          ' minutes for npm metadata, tags and the integrity-verified public archive.',
+      );
+    waiting = true;
+    await sleep(Math.min(intervalMs, remaining));
+  }
 }
 
 /** target_commitish is release metadata; the Git ref owns the actual tag identity. */
@@ -611,7 +676,7 @@ export async function publish() {
       nativeTag,
       '--registry=https://registry.npmjs.org',
     ]);
-  await verifyRegistryPublication(lock);
+  await verifyRegistryPublication(lock, getJson, { timeoutMs: 20 * 60_000 });
   console.log(
     'Published ' +
       lock.package.name +

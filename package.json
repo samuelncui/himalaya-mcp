@@ -1,6 +1,6 @@
 {
   "name": "himalaya-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "The original Himalaya email CLI as automatically generated MCP tools, with no user-side compilation.",
   "type": "module",
   "bin": {
