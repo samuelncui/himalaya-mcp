@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import * as tls from 'node:tls';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { gunzipSync } from 'node:zlib';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const directory = join(root, 'build', 'release');
@@ -200,6 +201,57 @@ export async function prepare(version = process.env.UPSTREAM_VERSION || undefine
   return plan;
 }
 
+/** CI-only archive diagnostics. No extraction or runtime/publisher dependency on tar. */
+export async function packageEvidence(file) {
+  const archive = await readFile(file);
+  if (archive.length > 32 * 1024 * 1024) throw new Error('Diagnostic package exceeds 32 MiB.');
+  const expanded = gunzipSync(archive, { maxOutputLength: 128 * 1024 * 1024 });
+  const { Parser } = await import('tar');
+  const entries = [];
+  let order = 0;
+  await new Promise((accept, reject) => {
+    const parser = new Parser({
+      strict: true,
+      onReadEntry(entry) {
+        const index = order++;
+        const content = createHash('sha256');
+        let size = 0;
+        entry.on('data', (bytes) => {
+          size += bytes.length;
+          content.update(bytes);
+        });
+        entry.once('error', reject);
+        entry.once('end', () =>
+          entries.push({
+            order: index,
+            path: entry.path,
+            type: entry.type,
+            size,
+            mode: entry.mode,
+            mtime: entry.mtime?.toISOString() ?? null,
+            uid: entry.uid ?? null,
+            gid: entry.gid ?? null,
+            uname: entry.uname ?? null,
+            gname: entry.gname ?? null,
+            sha256: content.digest('hex'),
+          }),
+        );
+        entry.resume();
+      },
+    });
+    parser.once('error', reject);
+    parser.once('finish', accept);
+    parser.end(expanded);
+  });
+  entries.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+  return {
+    archiveSha256: digest(archive),
+    tarSha256: digest(expanded),
+    gzipHeader: archive.subarray(0, 10).toString('hex'),
+    entries,
+  };
+}
+
 async function packArchive(stage, destination) {
   await mkdir(destination, { recursive: true });
   const packing = await runNpm(
@@ -213,6 +265,14 @@ async function packArchive(stage, destination) {
   const packagePath = join(destination, 'package.tgz');
   await copyFile(emitted, packagePath);
   if (emitted !== packagePath) await rm(emitted);
+  const toolchain = {
+    node: process.versions.node,
+    npm: (await runNpm(['--version'])).stdout.trim(),
+    zlib: process.versions.zlib,
+  };
+  console.log(
+    'Package evidence: ' + JSON.stringify({ toolchain, ...(await packageEvidence(packagePath)) }),
+  );
   return packagePath;
 }
 
@@ -457,6 +517,43 @@ async function getJson(url, github = false) {
   return response.json();
 }
 
+/** Registry version identity and both moving tags are separate publication facts. */
+export async function verifyRegistryPublication(lock, read = getJson) {
+  const base = 'https://registry.npmjs.org/' + encodeURIComponent(lock.package.name) + '/';
+  const [published, latest, native] = await Promise.all([
+    read(base + encodeURIComponent(lock.package.version)),
+    read(base + 'latest'),
+    read(base + 'himalaya-' + lock.upstream.version),
+  ]);
+  if (published?.dist?.integrity !== lock.artifact.integrity)
+    throw new Error(
+      'Published registry integrity has not been verified; rerun this workflow before declaring release complete.',
+    );
+  if (latest?.version !== lock.package.version || native?.version !== lock.package.version)
+    throw new Error(
+      'Published npm tags do not select the sealed version; rerun this workflow before declaring release complete.',
+    );
+}
+
+/** target_commitish is release metadata; the Git ref owns the actual tag identity. */
+export async function verifyReleaseTag(lock, read = getJson, allowMissing = false) {
+  const base = 'https://api.github.com/repos/' + lock.repository + '/git/';
+  const ref = await read(base + 'ref/tags/' + encodeURIComponent('v' + lock.package.version), true);
+  if (!ref && allowMissing) return;
+  let object = ref?.object;
+  const visited = new Set();
+  while (object?.type === 'tag') {
+    if (!revisionPattern.test(object.sha) || visited.has(object.sha) || visited.size >= 8)
+      throw new Error('GitHub release tag has invalid or cyclic annotated tag metadata.');
+    visited.add(object.sha);
+    object = (await read(base + 'tags/' + object.sha, true))?.object;
+  }
+  if (object?.type !== 'commit' || object.sha !== lock.adapter.revision)
+    throw new Error(
+      'GitHub release tag does not point to the sealed adapter commit; investigate before modifying the release.',
+    );
+}
+
 export async function publish() {
   const lock = await verifyRelease();
   assertTrustedWorkflow(lock, true);
@@ -480,7 +577,9 @@ export async function publish() {
       throw new Error(
         'This immutable npm version contains different bytes. Bump the reviewed adapter version; never overwrite or publish a stale artifact.',
       );
-    console.log('Existing immutable npm version verified byte-for-byte.');
+    console.log(
+      'Existing immutable npm version verified byte-for-byte. This reuse does not verify permission for a new OIDC npm publish.',
+    );
     if (latest?.version !== lock.package.version)
       await runNpm([
         'dist-tag',
@@ -512,13 +611,7 @@ export async function publish() {
       nativeTag,
       '--registry=https://registry.npmjs.org',
     ]);
-  const published = await getJson(
-    'https://registry.npmjs.org/' + name + '/' + encodeURIComponent(lock.package.version),
-  );
-  if (published?.dist?.integrity !== lock.artifact.integrity)
-    throw new Error(
-      'Published registry integrity has not been verified; rerun this workflow before declaring release complete.',
-    );
+  await verifyRegistryPublication(lock);
   console.log(
     'Published ' +
       lock.package.name +
@@ -567,6 +660,7 @@ export async function githubRelease() {
   assertTrustedWorkflow(lock);
   if (!process.env.GITHUB_TOKEN)
     throw new Error('GitHub Release requires its isolated contents:write job token.');
+  await verifyReleaseTag(lock, getJson, true);
   const tag = 'v' + lock.package.version;
   let release = await getJson(
     'https://api.github.com/repos/' + lock.repository + '/releases/tags/' + encodeURIComponent(tag),
@@ -641,6 +735,7 @@ export async function githubRelease() {
     release = await githubRequest('repos/' + lock.repository + '/releases/' + release.id, 'PATCH', {
       draft: false,
     });
+  await verifyReleaseTag(lock);
   console.log('GitHub Release ready: ' + release.html_url);
 }
 

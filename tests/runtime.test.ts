@@ -91,7 +91,7 @@ test('binary stdin/stdout and registered output resources preserve bytes', async
 test('uploaded files and string-or-file values share the generic file boundary', async (t) => {
   const ctx = await fixture(
     t,
-    `const last = argv.at(-1); process.stdout.write(JSON.stringify({ attach: (await readFile(options.attach)).toString('base64'), raw: (await readFile(last)).toString('base64') }));`,
+    `const last = argv.at(-1).replaceAll('$$', '$'); process.stdout.write(JSON.stringify({ attach: (await readFile(options.attach)).toString('base64'), raw: (await readFile(last)).toString('base64') }));`,
     [
       argument('attach', { action: 'Append', valueType: 'path' }),
       argument('message-raw', {
@@ -122,8 +122,16 @@ test('uploaded files and string-or-file values share the generic file boundary',
   assert.deepEqual(result.files, []);
   const hostFile = join(ctx.directory, 'host-secret.eml');
   await writeFile(hostFile, 'synthetic private value');
+  const rawHostFile = process.platform === 'win32' ? hostFile.replaceAll('\\', '/') : hostFile;
   await assert.rejects(
-    ctx.runtime.callTool(ctx.name, { params: { 'message-raw': [hostFile] } }),
+    ctx.runtime.callTool(ctx.name, { params: { 'message-raw': [rawHostFile] } }),
+    /inside this call workspace/,
+  );
+  assert.equal(process.env.HIMALAYA_MCP_FIXTURE_UNSET, undefined);
+  await assert.rejects(
+    ctx.runtime.callTool(ctx.name, {
+      params: { 'message-raw': ['${HIMALAYA_MCP_FIXTURE_UNSET:-' + rawHostFile + '}'] },
+    }),
     /inside this call workspace/,
   );
   if (process.platform !== 'win32') {
@@ -152,6 +160,56 @@ test('uploaded files and string-or-file values share the generic file boundary',
   );
 });
 
+test('literal uploaded dollar names stay literal for both PathBuf and shell-expanded message files', async (t) => {
+  const ctx = await fixture(
+    t,
+    `const file = argv.at(-1).replaceAll('$$', '$'); process.stdout.write(JSON.stringify({ attach: await readFile(options.attach, 'utf8'), raw: await readFile(file, 'utf8') }));`,
+    [
+      argument('attach', { action: 'Append', valueType: 'path' }),
+      argument('message-raw', {
+        index: 1,
+        long: null,
+        action: 'Append',
+        maxValues: null,
+        last: true,
+      }),
+    ],
+    { attach: 'inputFile', 'message-raw': 'inlineOrFile' },
+  );
+  const name = 'literal${HIMALAYA_MCP_FIXTURE_UNSET}.eml';
+  const result = await ctx.runtime.callTool(ctx.name, {
+    params: { attach: ['file:' + name], 'message-raw': ['file:' + name] },
+    files: [{ name, base64: Buffer.from('Subject: synthetic\r\n\r\nbody').toString('base64') }],
+  });
+  assert.deepEqual(JSON.parse(result.stdout), {
+    attach: 'Subject: synthetic\r\n\r\nbody',
+    raw: 'Subject: synthetic\r\n\r\nbody',
+  });
+});
+
+test('unknown shell variables in inline message text retain native inline semantics', async (t) => {
+  const ctx = await fixture(
+    t,
+    `process.stdout.write(await readFile(argv.at(-1).replaceAll('$$', '$'), 'utf8'));`,
+    [
+      argument('message-raw', {
+        index: 1,
+        long: null,
+        action: 'Append',
+        maxValues: null,
+        last: true,
+      }),
+    ],
+    { 'message-raw': 'inlineOrFile' },
+  );
+  const inline = 'Subject: ${HIMALAYA_MCP_FIXTURE_UNSET}\r\n\r\n$$(literal)';
+  assert.equal(
+    (await ctx.runtime.callTool(ctx.name, { params: { 'message-raw': [inline] } })).stdout,
+    inline,
+  );
+  assert.deepEqual(ctx.runtime.listResources(), []);
+});
+
 test('omitted output directories stay in the call workspace', async (t) => {
   const ctx = await fixture(
     t,
@@ -162,6 +220,40 @@ test('omitted output directories stay in the call workspace', async (t) => {
   const result = await ctx.runtime.callTool(ctx.name, {});
   assert.equal(result.files[0]?.name, 'attachment.bin');
   assert.equal((await ctx.runtime.readResource(result.files[0]!.uri)).contents[0]?.blob, '/wA=');
+});
+
+test('declared shell-expanded outputs are checked after expansion and bound exactly once', async (t) => {
+  const ctx = await fixture(
+    t,
+    `await writeFile(options.output.replaceAll('$$', '$'), 'synthetic');`,
+    [argument('output', { valueType: 'path' })],
+    {},
+    2_000,
+    {
+      profiles: {
+        schemaVersion: 1,
+        rules: [
+          { commands: ['**'], args: { output: 'outputFile' }, pathExpansion: { output: 'shell' } },
+        ],
+      },
+    },
+  );
+  const result = await ctx.runtime.callTool(ctx.name, {
+    params: { output: 'literal$$HIMALAYA_MCP_FIXTURE_UNSET.txt' },
+  });
+  assert.equal(result.files[0]?.name, 'literal$HIMALAYA_MCP_FIXTURE_UNSET.txt');
+  const outside =
+    process.platform === 'win32' ? ctx.directory.replaceAll('\\', '/') : ctx.directory;
+  await assert.rejects(
+    ctx.runtime.callTool(ctx.name, {
+      params: { output: '${HIMALAYA_MCP_FIXTURE_UNSET:-' + outside + '}/outside.txt' },
+    }),
+    /inside this call workspace/,
+  );
+  await assert.rejects(
+    ctx.runtime.callTool(ctx.name, { params: { output: '$HIMALAYA_MCP_FIXTURE_UNSET' } }),
+    /unset native path variable/,
+  );
 });
 
 test('account-relative paths retain native defaults and never become workspace paths', async (t) => {

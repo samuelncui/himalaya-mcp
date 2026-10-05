@@ -2,6 +2,8 @@
 schemaVersion: 1
 rules:
   - commands: ['**']
+    pathExpansion:
+      log-file: shell
     args:
       config_paths: config
       message-raw: inlineOrFile
@@ -16,6 +18,9 @@ rules:
   - commands: ['attachment download', 'completion', 'manual', 'json-schema']
     args:
       dir: outputDirectory
+  - commands: ['completion', 'manual', 'json-schema']
+    pathExpansion:
+      dir: shell
   - commands: ['gmail attachments get', 'msgraph attachments get']
     args:
       output: outputFile

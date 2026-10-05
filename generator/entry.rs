@@ -88,8 +88,14 @@ fn visit(
     command: &Command,
     path: Vec<String>,
     declared: &HashSet<Vec<String>>,
+    automatic_help: bool,
     commands: &mut Vec<Value>,
 ) {
+    assert!(
+        declared.contains(&path) || automatic_help,
+        "Undiscovered business command: {}",
+        path.join(" ")
+    );
     let mut rendered = command.clone();
     commands.push(json!({
         "path": path,
@@ -104,7 +110,15 @@ fn visit(
     for child in command.get_subcommands() {
         let mut child_path = path.clone();
         child_path.push(child.get_name().to_owned());
-        visit(child, child_path, declared, commands);
+        let child_is_automatic_help = automatic_help
+            || (!command.is_disable_help_subcommand_set() && child.get_name() == "help");
+        visit(
+            child,
+            child_path,
+            declared,
+            child_is_automatic_help,
+            commands,
+        );
     }
 }
 
@@ -115,13 +129,24 @@ fn command() -> Command {
     command
 }
 
-fn declared_paths(command: &Command, path: Vec<String>, paths: &mut HashSet<Vec<String>>) {
+fn collect_paths(command: &Command, path: Vec<String>, paths: &mut HashSet<Vec<String>>) {
     paths.insert(path.clone());
     for child in command.get_subcommands() {
         let mut next = path.clone();
         next.push(child.get_name().to_owned());
-        declared_paths(child, next, paths);
+        collect_paths(child, next, paths);
     }
+}
+
+fn declared_paths(command: Command) -> HashSet<Vec<String>> {
+    // Build deferred business registrations without Clap's automatic Help copies.
+    // This global setting propagates to children; explicitly registered Help
+    // commands remain ordinary business commands, regardless of their name.
+    let mut command = command.disable_help_subcommand(true);
+    command.build();
+    let mut paths = HashSet::new();
+    collect_paths(&command, Vec::new(), &mut paths);
+    paths
 }
 
 fn describe() -> Value {
@@ -131,13 +156,8 @@ fn describe() -> Value {
         .collect();
     features.sort_unstable();
     let mut commands = Vec::new();
-    let mut declared = HashSet::new();
-    declared_paths(
-        &<crate::cli::Cli as clap::CommandFactory>::command(),
-        Vec::new(),
-        &mut declared,
-    );
-    visit(&command(), Vec::new(), &declared, &mut commands);
+    let declared = declared_paths(<crate::cli::Cli as clap::CommandFactory>::command());
+    visit(&command(), Vec::new(), &declared, false, &mut commands);
     json!({
         "schemaVersion": 1,
         "native": {
@@ -239,5 +259,99 @@ pub fn entry() {
             eprintln!("Usage: generated CI helper <describe|parse>");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferred_business_commands_are_discovered() {
+        fn factory() -> Command {
+            Command::new("synthetic").defer(|command| {
+                command.subcommand(
+                    Command::new("later")
+                        .defer(|command| command.subcommand(Command::new("nested").hide(true))),
+                )
+            })
+        }
+        let declared = declared_paths(factory());
+        assert!(declared.contains(&vec!["later".to_owned()]));
+        assert!(declared.contains(&vec!["later".to_owned(), "nested".to_owned()]));
+        assert!(!declared.contains(&vec!["help".to_owned()]));
+        assert!(!declared.contains(&vec!["later".to_owned(), "help".to_owned()]));
+
+        let mut native = factory();
+        native.build();
+        let mut catalog = Vec::new();
+        visit(&native, Vec::new(), &declared, false, &mut catalog);
+        let deferred = catalog
+            .iter()
+            .find(|value| value["path"] == json!(["later", "nested"]))
+            .unwrap();
+        assert_eq!(deferred["frameworkGenerated"], false);
+        assert_eq!(deferred["runnable"], true);
+        assert_eq!(deferred["hidden"], true);
+        let generated = catalog
+            .iter()
+            .find(|value| value["path"] == json!(["help"]))
+            .unwrap();
+        assert_eq!(generated["frameworkGenerated"], true);
+        assert_eq!(generated["runnable"], false);
+        native
+            .try_get_matches_from(["synthetic", "later", "nested"])
+            .unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "Undiscovered business command: conditional")]
+    fn inconsistent_deferred_discovery_fails_closed() {
+        fn factory() -> Command {
+            Command::new("synthetic").defer(|command| {
+                if command.is_disable_help_subcommand_set() {
+                    command
+                } else {
+                    command.subcommand(Command::new("conditional"))
+                }
+            })
+        }
+        let declared = declared_paths(factory());
+        let mut native = factory();
+        native.build();
+        let mut catalog = Vec::new();
+        visit(&native, Vec::new(), &declared, false, &mut catalog);
+    }
+
+    #[test]
+    fn explicit_business_help_is_discovered() {
+        fn factory() -> Command {
+            Command::new("synthetic")
+                .disable_help_subcommand(true)
+                .subcommand(Command::new("help").arg(Arg::new("value").long("value")))
+        }
+        let declared = declared_paths(factory());
+        assert!(declared.contains(&vec!["help".to_owned()]));
+        let mut native = factory();
+        native.build();
+        let mut catalog = Vec::new();
+        visit(&native, Vec::new(), &declared, false, &mut catalog);
+        let business = catalog
+            .iter()
+            .find(|value| value["path"] == json!(["help"]))
+            .unwrap();
+        assert_eq!(business["frameworkGenerated"], false);
+        assert_eq!(business["runnable"], true);
+        let matches = native
+            .try_get_matches_from(["synthetic", "help", "--value=test"])
+            .unwrap();
+        assert_eq!(
+            matches
+                .subcommand_matches("help")
+                .unwrap()
+                .get_one::<String>("value")
+                .unwrap(),
+            "test"
+        );
     }
 }

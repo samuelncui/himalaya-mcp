@@ -23,7 +23,10 @@ export function commandProfile(command: CliCommand, profiles: Profiles): Profile
   const result: Profiles['rules'][number] = { commands: [], args: {} };
   for (const rule of profiles.rules) {
     if (!rule.commands.some((pattern) => matchesCommand(pattern, command.path))) continue;
-    Object.assign(result, rule, { args: { ...result.args, ...rule.args } });
+    Object.assign(result, rule, {
+      args: { ...result.args, ...rule.args },
+      pathExpansion: { ...result.pathExpansion, ...rule.pathExpansion },
+    });
   }
   return result;
 }
@@ -250,6 +253,7 @@ export function serialize(command: CliCommand, params: Record<string, unknown> =
     }
   }
   positional.sort((a, b) => (a.arg.index ?? 0) - (b.arg.index ?? 0));
+  const hasLast = command.args.some((arg) => arg.last);
   let omitted = false;
   const ordinary: string[] = [];
   const tail: string[] = [];
@@ -270,7 +274,7 @@ export function serialize(command: CliCommand, params: Record<string, unknown> =
       tail.push('--', ...provided.values);
       continue;
     }
-    if (provided.values.some((value) => value.startsWith('-'))) {
+    if (hasLast && provided.values.some((value) => value.startsWith('-'))) {
       if (!arg.allowHyphenValues && !arg.trailing)
         throw new AdapterError(
           'parameter_binding',
@@ -281,7 +285,6 @@ export function serialize(command: CliCommand, params: Record<string, unknown> =
   }
   // A variable-length option must not consume later positionals. A last/raw
   // argument owns the delimiter, so its preceding positionals go before flags.
-  const hasLast = command.args.some((arg) => arg.last);
   if (hasLast) return [...command.path, ...ordinary, ...flags, ...tail];
   return [...command.path, ...flags, ...(ordinary.length ? ['--'] : []), ...ordinary];
 }

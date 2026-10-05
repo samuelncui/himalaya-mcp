@@ -70,7 +70,7 @@ export async function smtpSmoke({ cli, catalog, environment = process.env, cache
       server.once('error', reject);
       server.listen(0, '127.0.0.1', accept);
     });
-    const config = join(directory, 'synthetic.toml');
+    const config = join(directory, 'synthetic$HIMALAYA_MCP_FIXTURE_UNSET.toml');
     await writeFile(
       config,
       `[accounts.fixture]\ndefault = true\nemail = "sender@example.invalid"\nsmtp.server = "smtp://127.0.0.1:${server.address().port}"\nsmtp.starttls = false\nmessage.send.backend = "smtp"\n`,
@@ -120,6 +120,7 @@ export async function smtpSmoke({ cli, catalog, environment = process.env, cache
       );
       const output = result.structuredContent ?? JSON.parse(result.content[0].text);
       assert.equal(output.exitCode, 0, `Native ${path} status`);
+      return output;
     };
     const attachment = Buffer.from([0, 255, 254, 65, 10, 42]);
     const encoded = attachment.toString('base64');
@@ -185,9 +186,10 @@ export async function smtpSmoke({ cli, catalog, environment = process.env, cache
       messages[0].data.toString().includes('Bcc: hidden@example.invalid'),
       'Explicit smtp send must retain native keep_bcc semantics',
     );
+    const uploadedName = 'synthetic${HIMALAYA_MCP_FIXTURE_UNSET}.eml';
     await call('message send', {
-      params: { account_name: 'fixture', no_save: true, 'message-raw': ['file:synthetic.eml'] },
-      files: [{ name: 'synthetic.eml', base64: Buffer.from(raw).toString('base64') }],
+      params: { account_name: 'fixture', no_save: true, 'message-raw': ['file:' + uploadedName] },
+      files: [{ name: uploadedName, base64: Buffer.from(raw).toString('base64') }],
     });
     assert.equal(messages.length, 2);
     assert.equal(messages[1].recipients.length, 3);
@@ -203,11 +205,11 @@ export async function smtpSmoke({ cli, catalog, environment = process.env, cache
         bcc: ['hidden@example.invalid'],
         subject: 'Synthetic attachment',
         body: 'Synthetic body',
-        attach: ['file:synthetic.bin'],
+        attach: ['file:synthetic$HIMALAYA_MCP_FIXTURE_UNSET.bin'],
         no_save: true,
         send: true,
       },
-      files: [{ name: 'synthetic.bin', base64: encoded }],
+      files: [{ name: 'synthetic$HIMALAYA_MCP_FIXTURE_UNSET.bin', base64: encoded }],
     });
     assert.equal(messages.length, 3);
     assert.equal(messages[2].recipients.length, 3);
@@ -219,8 +221,29 @@ export async function smtpSmoke({ cli, catalog, environment = process.env, cache
       !/^Bcc:/im.test(messages[2].data.toString()),
       'Native composed Bcc must stay envelope-only',
     );
+    await call('smtp send', {
+      params: {
+        account_name: 'fixture',
+        mail_from: 'sender@example.invalid',
+        rcpt_to: ['visible@example.invalid'],
+        'message-raw': [
+          'From: sender@example.invalid\r\nTo: visible@example.invalid\r\nSubject: Synthetic inline input\r\n\r\nLiteral ${HIMALAYA_MCP_FIXTURE_UNSET:-text} and $$ text\r\n',
+        ],
+      },
+    });
+    assert.equal(messages.length, 4);
+    assert(
+      messages[3].data
+        .toString()
+        .includes('Literal ${HIMALAYA_MCP_FIXTURE_UNSET:-text} and $$ text'),
+    );
+    const completion = await call('completion', {
+      params: { shells: ['bash'], dir: 'generated$$literal', 'log-file': 'log$$literal.txt' },
+    });
+    assert(completion.files.some((file) => file.name.startsWith('generated$literal/')));
+    assert(completion.files.some((file) => file.name === 'log$literal.txt'));
     console.error(
-      'Verified original Himalaya via packed MCP: raw nested MIME, shared send/Bcc, and composed binary attachment; 3 deliveries captured only on loopback.',
+      'Verified original Himalaya via packed MCP: raw nested MIME, shared send/Bcc, composed binary attachment, and literal inline input; 4 deliveries captured only on loopback.',
     );
   } finally {
     await client?.close();

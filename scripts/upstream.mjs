@@ -342,21 +342,24 @@ export async function generate(options = {}) {
     RUSTFLAGS: process.env.RUSTFLAGS ?? '-Awarnings',
   };
   delete environment.HIMALAYA_CONFIG;
-  await run(
-    'cargo',
-    [
-      'build',
-      '--locked',
-      '--manifest-path',
-      join(directory, 'Cargo.toml'),
-      '--no-default-features',
-      '--features',
-      lock.features.join(','),
-      '--jobs',
-      '2',
-    ],
-    { env: environment, stdio: ['ignore', 'inherit', 'inherit'] },
-  );
+  const cargoArgs = [
+    '--locked',
+    '--manifest-path',
+    join(directory, 'Cargo.toml'),
+    '--no-default-features',
+    '--features',
+    lock.features.join(','),
+    '--jobs',
+    '2',
+  ];
+  await run('cargo', ['build', ...cargoArgs], {
+    env: environment,
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
+  await run('cargo', ['test', ...cargoArgs, '--bin', 'himalaya', 'mcp_catalog::tests'], {
+    env: environment,
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
   const helper = join(
     build,
     'native',

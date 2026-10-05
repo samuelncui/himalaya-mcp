@@ -32,7 +32,7 @@ Native Himalaya owns account/backend behavior, email formats, OAuth configuratio
 
 ## Factual supplements and user choices
 
-Profiles supply effects, interactive behavior, and I/O roles that Clap types/Help cannot fully establish. They merge in order against canonical command patterns. They do not choose which commands are registered. Unknown effects use conservative write/destructive/non-idempotent annotations while execution remains available.
+Profiles supply effects, interactive behavior, I/O roles and factual `pathExpansion` rules that Clap types/Help cannot fully establish. They distinguish literal `PathBuf` fields from the upstream shell-expanding parser, including inherited log paths. Checked shell-expanded paths are escaped before native execution to preserve their exact identity. Profiles merge in order against canonical command patterns. They do not choose which commands are registered. Unknown effects use conservative write/destructive/non-idempotent annotations while execution remains available.
 
 Annotations cover a tool's permitted modes, including writable file options; a current call's parameters cannot change the static tool definition. They are independent of user exclusions. Sending may carry a destructive hint while remaining allowed by the user's policy.
 

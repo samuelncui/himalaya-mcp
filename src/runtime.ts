@@ -71,13 +71,52 @@ function decodeBase64(value: unknown): Buffer {
   return data;
 }
 
-function expandPath(value: string, env: NodeJS.ProcessEnv): string {
-  const expanded = value.replace(/^~(?=$|[/\\])/, homedir());
-  return expanded.replace(
-    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
-    (match, bracket: string | undefined, bare: string | undefined) =>
-      env[bracket ?? bare ?? ''] ?? match,
+/** Factual profiles identify native path_parser uses of shellexpand::full. */
+function expandShellPath(value: string, env: NodeJS.ProcessEnv): string | undefined {
+  let unresolved = false;
+  const expanded = value.replace(
+    /\$(\$|\{[^}]*\}|[\p{Alphabetic}\p{Number}_]+)/gu,
+    (match, token: string) => {
+      if (token === '$') return '$';
+      const braced = token.startsWith('{');
+      const expression = braced ? token.slice(1, -1) : token;
+      const split = braced ? expression.indexOf(':-') : -1;
+      const name = split > 0 ? expression.slice(0, split) : expression;
+      const key =
+        process.platform === 'win32'
+          ? Object.keys(env).find((key) => key.toLowerCase() === name.toLowerCase())
+          : name;
+      const found = key === undefined || !Object.hasOwn(env, key) ? undefined : env[key];
+      if (found !== undefined) return found; // An explicitly empty value is still set.
+      if (split > 0) return expression.slice(split + 2); // Defaults are not recursively expanded.
+      unresolved = true;
+      return match;
+    },
   );
+  if (unresolved) return undefined; // Native path_parser fails; MessageArg treats it as inline.
+  if (!value.startsWith('~')) return expanded; // A variable-provided '~' stays literal.
+  return expanded.replace(process.platform === 'win32' ? /^~(?=$|[/\\])/ : /^~(?=$|\/)/, () =>
+    homedir(),
+  );
+}
+
+/** Bind a checked path to the shell-expanding native config/MessageArg parser exactly once. */
+function expandedNativePath(value: string): string {
+  return (process.platform === 'win32' ? value.replaceAll('\\', '/') : value).replaceAll(
+    '$',
+    () => '$$',
+  );
+}
+
+function nativeMessageFile(value: string): string {
+  const path = expandedNativePath(value);
+  if (/\\[rn]/.test(path))
+    throw new AdapterError(
+      'parameter_binding',
+      'The native message parser cannot preserve this workspace path.',
+      'Use a workspace directory without literal backslash-r or backslash-n sequences.',
+    );
+  return path;
 }
 
 async function safePath(
@@ -85,9 +124,9 @@ async function safePath(
   cwd: string,
   uploads: string,
   role: IoRole,
-  env: NodeJS.ProcessEnv,
 ): Promise<string> {
-  const candidate = resolve(cwd, expandPath(value, env));
+  // Ordinary PathBuf arguments are literal. Expanding them would change native semantics.
+  const candidate = resolve(cwd, value);
   if (!inside(candidate, cwd))
     throw new AdapterError(
       'file_boundary',
@@ -316,13 +355,33 @@ export class Runtime {
             const upload = joined.slice(5);
             if (!names.has(upload))
               throw new AdapterError('input_file', 'Unknown uploaded file reference.');
-            const file = join(uploadRoot, upload);
-            const nativePath = process.platform === 'win32' ? file.replaceAll('\\', '/') : file;
+            const file = await safePath(join(uploadRoot, upload), cwd, uploadRoot, 'inputFile');
+            const nativePath = nativeMessageFile(file);
             params[arg.id] = Array.isArray(rawValues) ? [nativePath] : nativePath;
           } else {
-            const candidate = resolve(cwd, expandPath(joined, this.env));
-            const info = await stat(candidate).catch(() => undefined);
-            if (info?.isFile()) await safePath(joined, cwd, uploadRoot, 'inputFile', this.env);
+            const expanded = expandShellPath(joined, this.env);
+            const candidate = expanded === undefined ? undefined : resolve(cwd, expanded);
+            const info =
+              candidate === undefined ? undefined : await stat(candidate).catch(() => undefined);
+            if (info?.isFile()) {
+              const file = await safePath(candidate!, cwd, uploadRoot, 'inputFile');
+              const nativePath = nativeMessageFile(file);
+              params[arg.id] = Array.isArray(rawValues) ? [nativePath] : nativePath;
+            } else if (!Array.isArray(rawValues) || rawValues.length) {
+              // Fix the inline/file decision before spawning. The native parser must
+              // not discover a newly created host file and reinterpret inline text.
+              const bytes = Buffer.from(joined, 'utf8');
+              inputBytes += bytes.length;
+              if (inputBytes > INPUT_LIMIT)
+                throw new AdapterError(
+                  'input_limit',
+                  'Decoded stdin, files and inline file inputs exceed 32 MiB.',
+                );
+              const file = join(uploadRoot, randomUUID());
+              await writeFile(file, bytes, { flag: 'wx', mode: 0o400 });
+              const nativePath = nativeMessageFile(file);
+              params[arg.id] = Array.isArray(rawValues) ? [nativePath] : nativePath;
+            }
           }
           continue;
         }
@@ -330,13 +389,24 @@ export class Runtime {
           if (Array.isArray(value)) return Promise.all(value.map(convert));
           if (typeof value !== 'string')
             throw new AdapterError('input_file', `${arg.id} must contain path strings.`);
+          const expands = profile.pathExpansion?.[arg.id] === 'shell';
+          let file: string;
           if (value.startsWith('file:')) {
             const upload = value.slice(5);
             if (!names.has(upload))
               throw new AdapterError('input_file', 'Unknown uploaded file reference.');
-            return safePath(join(uploadRoot, upload), cwd!, uploadRoot, role, this.env);
+            file = join(uploadRoot, upload);
+          } else {
+            const expanded = expands ? expandShellPath(value, this.env) : value;
+            if (expanded === undefined)
+              throw new AdapterError(
+                'input_file',
+                `${arg.id} refers to an unset native path variable.`,
+              );
+            file = expanded;
           }
-          return safePath(value, cwd!, uploadRoot, role, this.env);
+          const path = await safePath(file, cwd!, uploadRoot, role);
+          return expands ? expandedNativePath(path) : path;
         };
         params[arg.id] = await convert(params[arg.id]);
       }
@@ -357,6 +427,7 @@ export class Runtime {
               'Put --workspace-dir on the same drive as --config; paths containing the native delimiter require a different filename.',
             );
         }
+        file = expandedNativePath(file);
         params[config.id] = config.action === 'Append' ? [file] : file;
       }
       const argv = serialize(command, params);
