@@ -53,6 +53,16 @@ Every pack logs `Package evidence` with Node/npm/zlib versions, compressed and u
 
 Omit `--version 2.2.1` on `prepare` to select the latest upstream release. The sealed package is `build/release/package.tgz`; its evidence is beside it. `publish` and `github` are isolated workflow stages, not local bypasses for failed CI. Keep candidate artifacts for investigation; never substitute files in a sealed release.
 
+## Check a published package's public file channel
+
+Run this opt-in check with a version already available on npm:
+
+```sh
+npm run smoke:public-file -- --version 2.2.1-adapter.0.1.3
+```
+
+It installs that published package without lifecycle scripts, downloads a pinned public JPEG over real HTTPS, and asks the original Himalaya binary to compose a MIME preview. It checks exact attachment bytes, receipt metadata and input cleanup. Its temporary Maildir has no sending backend; no email is delivered. Package installation, binary retrieval and file retrieval use the public network. The fixture and temporary installation are removed on completion. This proves the server download path; actual ChatGPT file forwarding and deployment authentication still require a check through the intended client.
+
 ## Failed or interrupted releases
 
 Inspect the exact failed run and its artifacts before changing code:

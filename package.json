@@ -37,7 +37,8 @@
     "verify:native": "node scripts/upstream.mjs verify",
     "smoke:pack": "node scripts/smoke-pack.mjs",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "smoke:public-file": "node scripts/public-file-smoke.mjs"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.3.0",
