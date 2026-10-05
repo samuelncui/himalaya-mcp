@@ -555,7 +555,7 @@ export class Runtime {
             'artifact_limit',
             'Native file output exceeded the artifact limit; no partial files are returned.',
           );
-        const name = relative(cwd, path);
+        const name = relative(cwd, path).split(sep).join('/');
         found.push({
           name,
           path,

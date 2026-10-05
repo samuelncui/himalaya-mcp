@@ -88,6 +88,25 @@ test('binary stdin/stdout and registered output resources preserve bytes', async
   assert.deepEqual(await readdir(ctx.workspaces), []);
 });
 
+test('nested output resources use portable names while preserving native file bytes', async (t) => {
+  const ctx = await fixture(
+    t,
+    `await mkdir(options.output, { recursive: true }); await writeFile(options.output + '/mail.bin', stdin);`,
+    [argument('output', { valueType: 'path' })],
+    { output: 'outputDirectory' },
+  );
+  const input = Buffer.from([0, 255, 13, 10]);
+  const result = await ctx.runtime.callTool(ctx.name, {
+    params: { output: 'nested' },
+    stdinBase64: input.toString('base64'),
+  });
+  assert.equal(result.files[0]?.name, 'nested/mail.bin');
+  assert.equal(ctx.runtime.listResources()[0]?.name, 'nested/mail.bin');
+  assert(result.files[0]!.uri.endsWith('/nested%2Fmail.bin'));
+  const resource = await ctx.runtime.readResource(result.files[0]!.uri);
+  assert.equal(resource.contents[0]?.blob, input.toString('base64'));
+});
+
 test('uploaded files and string-or-file values share the generic file boundary', async (t) => {
   const ctx = await fixture(
     t,
