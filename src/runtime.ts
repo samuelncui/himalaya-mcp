@@ -14,9 +14,17 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { TextDecoder } from 'node:util';
-import { buildTools, commandProfile, serialize, toolName } from './catalog.js';
+import {
+  buildTools,
+  commandProfile,
+  fileParameters,
+  matchesCommand,
+  serialize,
+  toolName,
+} from './catalog.js';
+import { downloadFile, validateFileReference } from './file-input.js';
 import { enforcePolicy, loadPolicy } from './policy.js';
 import {
   AdapterError,
@@ -26,6 +34,7 @@ import {
   type CliCommand,
   type IoRole,
   type Manifest,
+  type OpenAIFile,
   type Profiles,
   type RunResult,
 } from './types.js';
@@ -44,6 +53,8 @@ export interface RuntimeOptions {
   policyPath?: string;
   workspaceRoot?: string;
   timeoutMs?: number;
+  fileDownloader?: typeof downloadFile;
+  configuredBackends?: ReadonlySet<string>;
 }
 
 interface StoredArtifact extends Artifact {
@@ -56,19 +67,6 @@ function inside(path: string, root: string): boolean {
   return (
     suffix === '' || (suffix !== '..' && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix))
   );
-}
-
-function decodeBase64(value: unknown): Buffer {
-  if (
-    typeof value !== 'string' ||
-    value.length > INPUT_LIMIT * 1.4 ||
-    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
-  )
-    throw new AdapterError('input_base64', 'Expected canonical base64 within the input limit.');
-  const data = Buffer.from(value, 'base64');
-  if (data.toString('base64') !== value)
-    throw new AdapterError('input_base64', 'Expected canonical base64.');
-  return data;
 }
 
 /** Factual profiles identify native path_parser uses of shellexpand::full. */
@@ -131,7 +129,7 @@ async function safePath(
     throw new AdapterError(
       'file_boundary',
       'File arguments must stay inside this call workspace.',
-      'Upload the file and use file:<name>; host configuration is selected at server startup.',
+      'Pass the declared top-level file object; host configuration is selected at server startup.',
     );
   let ancestor = candidate;
   for (;;) {
@@ -181,11 +179,14 @@ export class Runtime {
   private readonly artifacts = new Map<string, StoredArtifact>();
   private readonly workspaces = new Set<string>();
   private readonly root: string;
+  private readonly downloadAbort = new AbortController();
   private readonly env: NodeJS.ProcessEnv;
+  private configuredBackends: ReadonlySet<string> | undefined;
   private closed = false;
   private closing: Promise<void> | undefined;
   private active = 0;
   private artifactBytes = 0;
+  private readonly reapTimer: ReturnType<typeof setInterval>;
 
   constructor(private readonly options: RuntimeOptions) {
     const native = options.manifest.himalaya;
@@ -205,13 +206,99 @@ export class Runtime {
       options.workspaceRoot ?? join(tmpdir(), `himalaya-mcp-${process.getuid?.() ?? 'user'}`),
     );
     this.env = { ...process.env };
+    this.configuredBackends = options.configuredBackends;
+    this.reapTimer = setInterval(() => {
+      void this.reap().catch(() =>
+        process.stderr.write('Temporary artifact cleanup failed; retrying on the next sweep.\n'),
+      );
+    }, 60_000);
+    this.reapTimer.unref();
   }
 
-  tools() {
-    return this.definitions;
+  async tools() {
+    const policy = await loadPolicy(this.options.policyPath);
+    return this.definitions.filter((tool) => {
+      const command = this.commands.get(tool.name)!;
+      const profile = commandProfile(command, this.options.profiles);
+      return (
+        !profile.interactive &&
+        (!profile.requiresBackend ||
+          this.configuredBackends === undefined ||
+          this.configuredBackends.has(profile.requiresBackend)) &&
+        !policy.deny.some(
+          (rule) =>
+            matchesCommand(rule.command, command.path) &&
+            (!rule.when || !Object.keys(rule.when).length),
+        )
+      );
+    });
   }
 
-  callTool(name: string, raw: CallInput): Promise<RunResult> {
+  /** Native configuration owns this metadata; no mailbox connection or secret resolution. */
+  async discoverBackends(): Promise<void> {
+    const command = [...this.commands.values()].find(
+      (command) => command.path.join(' ') === 'account list',
+    );
+    if (!command)
+      throw new AdapterError('backend_discovery', 'This catalog lacks native account metadata.');
+    const result = await this.callTool(toolName(command), { params: { json: true } });
+    let accounts: unknown;
+    try {
+      accounts = (JSON.parse(result.stdout) as { accounts?: unknown }).accounts;
+    } catch {
+      throw new AdapterError('backend_discovery', 'Native account metadata could not be read.');
+    }
+    if (
+      result.exitCode !== 0 ||
+      !Array.isArray(accounts) ||
+      accounts.some(
+        (account: unknown) =>
+          !account ||
+          typeof account !== 'object' ||
+          typeof (account as { name?: unknown }).name !== 'string' ||
+          !Array.isArray((account as { backends?: unknown }).backends) ||
+          (account as { backends: unknown[] }).backends.some(
+            (backend) => typeof backend !== 'string',
+          ),
+      )
+    )
+      throw new AdapterError(
+        'backend_discovery',
+        'Native account metadata is unavailable; check the native configuration.',
+      );
+    const backends = new Set(
+      accounts.flatMap((account: { backends: string[] }) => account.backends),
+    );
+    for (const probe of this.commands.values()) {
+      const profile = commandProfile(probe, this.options.profiles);
+      if (
+        !profile.capabilityProbe ||
+        !profile.requiresBackend ||
+        backends.has(profile.requiresBackend)
+      )
+        continue;
+      for (const account of accounts as { name?: unknown }[]) {
+        if (typeof account.name !== 'string')
+          throw new AdapterError('backend_discovery', 'Invalid native account metadata.');
+        let checked: RunResult;
+        try {
+          checked = await this.callTool(toolName(probe), {
+            params: { json: true, account_name: account.name },
+          });
+        } catch (error) {
+          if (error instanceof AdapterError && error.code === 'policy_denied') break;
+          throw error;
+        }
+        if (checked.exitCode === 0) {
+          backends.add(profile.requiresBackend);
+          break;
+        }
+      }
+    }
+    this.configuredBackends = backends;
+  }
+
+  callTool(name: string, raw: CallInput, beforeExecute?: () => Promise<void>): Promise<RunResult> {
     if (this.closed)
       return Promise.reject(new AdapterError('runtime_closed', 'The server is closing.'));
     if (this.active >= 4)
@@ -219,7 +306,7 @@ export class Runtime {
         new AdapterError('runtime_busy', 'Four native calls are already running.'),
       );
     this.active++;
-    const call = this.runTool(name, raw);
+    const call = this.runTool(name, raw, beforeExecute);
     this.calls.add(call);
     const finished = () => {
       this.calls.delete(call);
@@ -229,57 +316,109 @@ export class Runtime {
     return call;
   }
 
-  private async runTool(name: string, raw: CallInput): Promise<RunResult> {
+  private async runTool(
+    name: string,
+    raw: CallInput,
+    beforeExecute?: () => Promise<void>,
+  ): Promise<RunResult> {
     const command = this.commands.get(name);
     if (!command) throw new AdapterError('unknown_tool', `Unknown generated tool: ${name}`);
+    const fileParams = fileParameters(command, this.options.profiles);
+    const allowed = new Set(['params', ...fileParams.map(({ argument }) => argument.id)]);
     if (
       !raw ||
       typeof raw !== 'object' ||
       Array.isArray(raw) ||
-      Object.keys(raw).some((key) => !['params', 'stdin', 'stdinBase64', 'files'].includes(key))
+      Object.keys(raw).some((key) => !allowed.has(key))
     )
       throw new AdapterError(
         'input_shape',
-        'Use params, stdin or stdinBase64, and files; raw argv is not accepted.',
+        'Use params and generated file-object fields only. File bytes, stdin, base64, local paths and raw argv are not input channels.',
       );
+    if (
+      raw.params !== undefined &&
+      (!raw.params || typeof raw.params !== 'object' || Array.isArray(raw.params))
+    )
+      throw new AdapterError('input_shape', 'params must be an object.');
     const params = structuredClone(raw.params ?? {});
-    serialize(command, params); // Validate shapes before allocating a workspace.
-    if (raw.stdin !== undefined && typeof raw.stdin !== 'string')
-      throw new AdapterError('input_shape', 'stdin must be a UTF-8 string.');
-    if (raw.stdin !== undefined && raw.stdinBase64 !== undefined)
-      throw new AdapterError('input_shape', 'stdin and stdinBase64 are mutually exclusive.');
-    const stdin =
-      raw.stdinBase64 === undefined
-        ? Buffer.from(raw.stdin ?? '', 'utf8')
-        : decodeBase64(raw.stdinBase64);
-    let inputBytes = stdin.length;
-    if (inputBytes > INPUT_LIMIT)
-      throw new AdapterError('input_limit', 'Decoded stdin and files exceed 32 MiB.');
-    if (raw.files !== undefined && !Array.isArray(raw.files))
-      throw new AdapterError('input_shape', 'files must be an array.');
+    const profile = commandProfile(command, this.options.profiles);
+    // These checks require no files. Reject config changes and backend path escapes
+    // before creating a workspace or downloading any supplied attachments.
+    for (const arg of command.args) {
+      const role = profile.args?.[arg.id];
+      if (['inputFile', 'inlineOrFile'].includes(role ?? '') && Object.hasOwn(params, arg.id))
+        throw new AdapterError(
+          'input_file',
+          `Use the top-level ${arg.id} file-object field; this file argument is not accepted in params.`,
+        );
+      if (role === 'config' && Object.hasOwn(params, arg.id))
+        throw new AdapterError(
+          'config_boundary',
+          'Native configuration is selected by the server, not a tool argument.',
+          'Set --config when starting himalaya-mcp.',
+        );
+      if (role !== 'accountPath') continue;
+      const valid = (value: unknown): boolean =>
+        Array.isArray(value)
+          ? value.every(valid)
+          : typeof value === 'string' &&
+            !isAbsolute(value) &&
+            !/^[A-Za-z]:|^\\\\|\0|[\r\n]/.test(value) &&
+            !value.split(/[\\/]/).includes('..');
+      if (params[arg.id] !== undefined && !valid(params[arg.id]))
+        throw new AdapterError(
+          'file_boundary',
+          `${arg.id} must be relative to the configured account root without parent traversal.`,
+        );
+    }
+    let inputBytes = 0;
     const names = new Set<string>();
-    const uploads = (raw.files ?? []).map((file) => {
-      if (
-        !file ||
-        typeof file !== 'object' ||
-        Object.keys(file).some((key) => !['name', 'base64'].includes(key)) ||
-        typeof file.name !== 'string' ||
-        !file.name ||
-        file.name !== basename(file.name) ||
-        /[\\/\0\r\n]/.test(file.name) ||
-        ['.', '..'].includes(file.name) ||
-        names.has(file.name)
-      )
-        throw new AdapterError('input_file', 'Upload names must be unique basenames.');
-      names.add(file.name);
-      const bytes = decodeBase64(file.base64);
-      inputBytes += bytes.length;
-      if (inputBytes > INPUT_LIMIT)
-        throw new AdapterError('input_limit', 'Decoded stdin and files exceed 32 MiB.');
-      return { name: file.name, bytes };
-    });
+    const downloads = new Map<string, OpenAIFile>();
+    for (const { argument, multiple, nativeArray } of fileParams) {
+      const value = raw[argument.id];
+      if (value === undefined) continue;
+      if (multiple !== Array.isArray(value))
+        throw new AdapterError(
+          'input_file',
+          `${argument.id} requires ${multiple ? 'an array of file objects' : 'one file object'}.`,
+        );
+      const refs = (multiple ? (value as unknown[]) : [value]).map((source) => {
+        const { name, file } = validateFileReference(source);
+        const previous = downloads.get(name);
+        if (
+          names.has(name) &&
+          (!previous ||
+            previous.file_id !== file.file_id ||
+            previous.download_url !== file.download_url)
+        )
+          throw new AdapterError(
+            'input_file',
+            'Different uploaded files must have unique basenames.',
+          );
+        names.add(name);
+        downloads.set(name, file);
+        return `file:${name}`;
+      });
+      params[argument.id] = nativeArray ? refs : refs[0];
+    }
+    serialize(command, params); // Validate canonical shapes before policy, network or allocation.
     // Read policy for each call so a user edit takes effect without replacing the process.
     enforcePolicy(await loadPolicy(this.options.policyPath), command, params);
+    if (profile.interactive)
+      throw new AdapterError(
+        'interactive_required',
+        'This native command requires a terminal and is not exposed by MCP.',
+        'Use the original Himalaya CLI in a terminal.',
+      );
+    if (
+      profile.requiresBackend &&
+      this.configuredBackends !== undefined &&
+      !this.configuredBackends.has(profile.requiresBackend)
+    )
+      throw new AdapterError(
+        'backend_unavailable',
+        'This instance has no native configuration for the required backend.',
+      );
     if (this.closed) throw new AdapterError('runtime_closed', 'The server is closing.');
     let cwd: string | undefined;
     try {
@@ -305,36 +444,36 @@ export class Runtime {
       this.callWorkspaces.add(cwd);
       const uploadRoot = join(cwd, 'uploads');
       await mkdir(uploadRoot, { mode: 0o700 });
-      for (const upload of uploads)
-        await writeFile(join(uploadRoot, upload.name), upload.bytes, { flag: 'wx', mode: 0o400 });
-      const profile = commandProfile(command, this.options.profiles);
+      if (downloads.size) {
+        const deadline = AbortSignal.timeout(30_000);
+        const signal = AbortSignal.any([this.downloadAbort.signal, deadline]);
+        try {
+          for (const [name, file] of downloads) {
+            const bytes = await (this.options.fileDownloader ?? downloadFile)(
+              file,
+              INPUT_LIMIT - inputBytes,
+              signal,
+            );
+            if (signal.aborted) throw signal.reason;
+            inputBytes += bytes.length;
+            if (inputBytes > INPUT_LIMIT)
+              throw new AdapterError('input_limit', 'Imported files exceed 32 MiB per call.');
+            await writeFile(join(uploadRoot, name), bytes, { flag: 'wx', mode: 0o400 });
+          }
+        } catch (error) {
+          if (this.closed) throw new AdapterError('runtime_closed', 'The server is closing.');
+          if (deadline.aborted)
+            throw new AdapterError(
+              'file_timeout',
+              'File imports exceeded their 30 second deadline.',
+            );
+          throw error;
+        }
+      }
       for (const arg of command.args) {
         const role = profile.args?.[arg.id] ?? (arg.valueType === 'path' ? 'path' : undefined);
         if (!role) continue;
-        if (role === 'config') {
-          if (Object.hasOwn(params, arg.id))
-            throw new AdapterError(
-              'config_boundary',
-              'Native configuration is selected by the server, not a tool argument.',
-              'Set --config when starting himalaya-mcp.',
-            );
-          continue;
-        }
-        if (role === 'accountPath') {
-          const value = params[arg.id];
-          if (
-            value !== undefined &&
-            (typeof value !== 'string' ||
-              isAbsolute(value) ||
-              /^[A-Za-z]:|[\\$~]/.test(value) ||
-              value.split('/').includes('..'))
-          )
-            throw new AdapterError(
-              'file_boundary',
-              `${arg.id} must be relative to the configured account root without parent traversal.`,
-            );
-          continue;
-        }
+        if (['config', 'accountPath'].includes(role)) continue;
         if (!Object.hasOwn(params, arg.id)) {
           if (role === 'outputDirectory') params[arg.id] = '.';
           else if (arg.defaultValues.length && arg.valueType === 'path') {
@@ -342,46 +481,6 @@ export class Runtime {
               'file_default',
               `Supply ${arg.id} explicitly; its native path default is outside the call contract.`,
             );
-          }
-          continue;
-        }
-        if (role === 'inlineOrFile') {
-          const rawValues = params[arg.id];
-          const joined = (Array.isArray(rawValues) ? rawValues : [rawValues])
-            .join(' ')
-            .replaceAll('\\r', '')
-            .replaceAll('\\n', '\r\n');
-          if (joined.startsWith('file:')) {
-            const upload = joined.slice(5);
-            if (!names.has(upload))
-              throw new AdapterError('input_file', 'Unknown uploaded file reference.');
-            const file = await safePath(join(uploadRoot, upload), cwd, uploadRoot, 'inputFile');
-            const nativePath = nativeMessageFile(file);
-            params[arg.id] = Array.isArray(rawValues) ? [nativePath] : nativePath;
-          } else {
-            const expanded = expandShellPath(joined, this.env);
-            const candidate = expanded === undefined ? undefined : resolve(cwd, expanded);
-            const info =
-              candidate === undefined ? undefined : await stat(candidate).catch(() => undefined);
-            if (info?.isFile()) {
-              const file = await safePath(candidate!, cwd, uploadRoot, 'inputFile');
-              const nativePath = nativeMessageFile(file);
-              params[arg.id] = Array.isArray(rawValues) ? [nativePath] : nativePath;
-            } else if (!Array.isArray(rawValues) || rawValues.length) {
-              // Fix the inline/file decision before spawning. The native parser must
-              // not discover a newly created host file and reinterpret inline text.
-              const bytes = Buffer.from(joined, 'utf8');
-              inputBytes += bytes.length;
-              if (inputBytes > INPUT_LIMIT)
-                throw new AdapterError(
-                  'input_limit',
-                  'Decoded stdin, files and inline file inputs exceed 32 MiB.',
-                );
-              const file = join(uploadRoot, randomUUID());
-              await writeFile(file, bytes, { flag: 'wx', mode: 0o400 });
-              const nativePath = nativeMessageFile(file);
-              params[arg.id] = Array.isArray(rawValues) ? [nativePath] : nativePath;
-            }
           }
           continue;
         }
@@ -405,7 +504,13 @@ export class Runtime {
               );
             file = expanded;
           }
-          const path = await safePath(file, cwd!, uploadRoot, role);
+          const path = await safePath(
+            file,
+            cwd!,
+            uploadRoot,
+            role === 'inlineOrFile' ? 'inputFile' : role,
+          );
+          if (role === 'inlineOrFile') return nativeMessageFile(path);
           return expands ? expandedNativePath(path) : path;
         };
         params[arg.id] = await convert(params[arg.id]);
@@ -432,10 +537,16 @@ export class Runtime {
       }
       const argv = serialize(command, params);
       if (this.closed) throw new AdapterError('runtime_closed', 'The server is closing.');
-      const result = await this.execute(argv, cwd, stdin);
+      // Persist the execution boundary before starting an irreversible native operation.
+      await beforeExecute?.();
       if (this.closed) throw new AdapterError('runtime_closed', 'The server is closing.');
+      const result = await this.execute(argv, cwd);
+      if (this.closed) throw new AdapterError('runtime_closed', 'The server is closing.');
+      // Inputs never become retained resources, even when the command produced outputs.
+      await rm(uploadRoot, { recursive: true, force: true });
       result.files = await this.collect(cwd, uploadRoot);
-      this.workspaces.add(cwd);
+      if (result.files.length) this.workspaces.add(cwd);
+      else await rm(cwd, { recursive: true, force: true });
       this.callWorkspaces.delete(cwd);
       cwd = undefined;
       return result;
@@ -447,7 +558,7 @@ export class Runtime {
     }
   }
 
-  private execute(argv: string[], cwd: string, stdin: Buffer): Promise<RunResult> {
+  private execute(argv: string[], cwd: string): Promise<RunResult> {
     return new Promise((resolveResult, reject) => {
       const child = spawn(this.options.binaryPath, argv, {
         cwd,
@@ -514,7 +625,7 @@ export class Runtime {
           ...(timedOut ? { timedOut: true } : {}),
         });
       });
-      child.stdin.end(stdin);
+      child.stdin.end();
     });
   }
 
@@ -604,13 +715,15 @@ export class Runtime {
     }
     for (const cwd of this.workspaces) {
       if ([...this.artifacts.values()].some((artifact) => inside(artifact.path, cwd))) continue;
-      this.workspaces.delete(cwd);
       await rm(cwd, { recursive: true, force: true });
+      this.workspaces.delete(cwd);
     }
   }
 
   close(): Promise<void> {
     this.closed = true;
+    clearInterval(this.reapTimer);
+    this.downloadAbort.abort();
     this.closing ??= this.closeAll();
     return this.closing;
   }

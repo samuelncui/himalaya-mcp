@@ -12,12 +12,17 @@ import {
 } from '@modelcontextprotocol/server';
 import { serveStdio, StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { hostHeaderValidation, originValidation, toNodeHandler } from '@modelcontextprotocol/node';
-import { AdapterError, type CallInput, type RunResult, type ToolDefinition } from './types.js';
+import { SERVER_INSTRUCTIONS } from './instructions.js';
+import { AdapterError, type CallInput, type McpCallResult, type ToolDefinition } from './types.js';
 
 /** Protocol plumbing only. Validation, execution, and artifact ownership belong to Runtime. */
 export interface McpRuntime {
-  tools(): ToolDefinition[];
-  callTool(name: string, input: CallInput): Promise<RunResult>;
+  tools(): ToolDefinition[] | Promise<ToolDefinition[]>;
+  callTool(
+    name: string,
+    input: CallInput,
+    beforeExecute?: () => Promise<void>,
+  ): Promise<McpCallResult>;
   listResources(): Resource[];
   readResource(uri: string): Promise<ReadResourceResult>;
   close(): Promise<void>;
@@ -29,7 +34,7 @@ export interface RunningServer {
   url?: string;
 }
 
-// Base64 attachments count toward this wire limit; native/backend size limits still apply.
+// Metadata/text still count toward the wire limit; imported bytes have a separate limit.
 export const MAX_MCP_MESSAGE_BYTES = 64 * 1024 * 1024;
 
 /** Only deliberate adapter errors are safe to display; arbitrary exceptions may contain inputs. */
@@ -41,10 +46,13 @@ export function errorMessage(error: unknown): string {
 export function createMcpServer(runtime: McpRuntime, version: string): Server {
   const server = new Server(
     { name: 'himalaya-mcp', version },
-    { capabilities: { tools: {}, resources: {} } },
+    {
+      capabilities: { tools: {}, resources: {} },
+      instructions: SERVER_INSTRUCTIONS,
+    },
   );
-  server.setRequestHandler('tools/list', () => ({
-    tools: runtime.tools().map((tool) => {
+  server.setRequestHandler('tools/list', async () => ({
+    tools: (await runtime.tools()).map((tool) => {
       const parsed = specTypeSchemas.Tool['~standard'].validate(tool);
       if (parsed.issues)
         throw new ProtocolError(
@@ -60,7 +68,13 @@ export function createMcpServer(runtime: McpRuntime, version: string): Server {
       return {
         content: [{ type: 'text', text: JSON.stringify(result) }],
         structuredContent: { ...result },
-        isError: result.exitCode !== 0 || result.timedOut === true,
+        isError:
+          'operation' in result
+            ? result.operation.state === 'not_executed' &&
+              request.params.name !== 'himalaya_mcp_operation_status'
+            : 'operations' in result
+              ? false
+              : result.exitCode !== 0 || result.timedOut === true,
       };
     } catch (error) {
       return { content: [{ type: 'text', text: errorMessage(error) }], isError: true };

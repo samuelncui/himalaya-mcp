@@ -4,7 +4,7 @@
 
 Normal source changes use reviewed pull requests. Commit the initial empty repository on `main` before preparing a candidate; release preparation rejects a dirty or uncommitted checkout. The user owns deployment credentials and dangerous-operation policy. Automation does not edit that policy or require maintainers to approve new dangerous entries.
 
-The npm version is `<native-version>-adapter.<adapter-version>`, for example `2.2.1-adapter.0.1.2`. Tracked `package.json` holds the adapter version (`0.1.2`); assembly changes only the staging copy. Before issuing any new adapter revision for the same native version, bump the adapter SemVer through a reviewed change, including workflow-only changes: the sealed Git revision is packaged provenance and changes the archive bytes. npm versions are immutable: the same version with different bytes is rejected.
+The npm version is `<native-version>-adapter.<adapter-version>`, for example `2.2.1-adapter.0.1.3`. Tracked `package.json` holds only the adapter SemVer; assembly changes only the staging copy. Before issuing any new adapter revision for the same native version, bump the adapter SemVer through a reviewed change, including workflow-only changes: the sealed Git revision is packaged provenance and changes the archive bytes. npm versions are immutable: the same version with different bytes is rejected.
 
 ## Automatic upstream release
 

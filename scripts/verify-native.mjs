@@ -25,6 +25,27 @@ function expectedValues(arg, value) {
   return [String(value)];
 }
 
+/** Schema fields import files; parser differential tests still exercise canonical native parameters. */
+function schemaInput(definition, nativeParams) {
+  const params = { ...nativeParams };
+  const input = { params };
+  for (const id of definition._meta?.['openai/fileParams'] ?? []) {
+    if (!Object.hasOwn(params, id)) continue;
+    const ref = {
+      file_id: 'synthetic-file',
+      download_url: 'https://files.example.invalid/synthetic',
+      file_name: 'synthetic.bin',
+    };
+    const schema = definition.inputSchema.properties[id];
+    input[id] =
+      schema.type === 'array'
+        ? (Array.isArray(params[id]) ? params[id] : [params[id]]).map(() => ref)
+        : ref;
+    delete params[id];
+  }
+  return input;
+}
+
 function checkBinding(command, params, result, name) {
   assert.equal(result.ok, true, `${name}: ${result.error ?? 'native parse failed'}`);
   assert.deepEqual(result.path, command.path, `${name}: canonical command binding`);
@@ -108,13 +129,19 @@ async function checkGeneratedFields(catalog, cases, fixture, serialize, definiti
     return arg.index === null && arg.action === 'Append' ? [group] : group;
   };
   const validators = new Map(
-    definitions.map((definition) => [definition.name, ajv.compile(definition.inputSchema)]),
+    definitions.map((definition) => [
+      definition.name,
+      { definition, validate: ajv.compile(definition.inputSchema) },
+    ]),
   );
   const validateShape = (test) => {
     const name = ['himalaya', ...test.command.path].join('_');
-    const validate = validators.get(name);
-    assert(validate, `Missing generated tool for ${test.command.path.join(' ')}`);
-    assert(validate({ params: test.params }), `${test.name}: ${JSON.stringify(validate.errors)}`);
+    const entry = validators.get(name);
+    assert(entry, `Missing generated tool for ${test.command.path.join(' ')}`);
+    assert(
+      entry.validate(schemaInput(entry.definition, test.params)),
+      `${test.name}: ${JSON.stringify(entry.validate.errors)}`,
+    );
   };
   const fields = [];
   for (const command of catalog.commands.filter((command) => command.runnable)) {
@@ -397,7 +424,7 @@ export async function verifyNative() {
     assert(definition, `Missing generated tool for ${test.path.join(' ')}`);
     const validate = ajv.compile(definition.inputSchema);
     assert(
-      validate({ params }),
+      validate(schemaInput(definition, params)),
       `${test.name}: generated schema rejected valid field shape: ${JSON.stringify(validate.errors)}`,
     );
     requests.push({ argv: serialize(command, params) });

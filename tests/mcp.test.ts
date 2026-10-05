@@ -16,6 +16,10 @@ import {
 import type { ReadResourceResult, Resource } from '@modelcontextprotocol/server';
 import { loadBundle, parseOptions, runCli } from '../src/cli.js';
 import { createMcpServer, startHttp, startStdio, type McpRuntime } from '../src/mcp.js';
+import { SERVER_INSTRUCTIONS } from '../src/instructions.js';
+import { operationTools } from '../src/operations.js';
+import { buildTools } from '../src/catalog.js';
+import { argument, catalog, command } from './fixtures.js';
 import {
   AdapterError,
   type CallInput,
@@ -37,9 +41,6 @@ const tool: ToolDefinition = {
         properties: { account: { type: 'string' } },
         additionalProperties: false,
       },
-      stdin: { type: 'string' },
-      stdinBase64: { type: 'string' },
-      files: { type: 'array' },
     },
   },
   annotations: {
@@ -94,7 +95,7 @@ class SyntheticRuntime implements McpRuntime {
 }
 
 async function memoryClient(
-  runtime: SyntheticRuntime,
+  runtime: McpRuntime,
 ): Promise<{ client: Client; close(): Promise<void> }> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const server = createMcpServer(runtime, '0.1.0-test');
@@ -116,14 +117,94 @@ test('MCP preserves generated Help, schemas, annotations, and the complete regis
   assert.deepEqual((await connection.client.listTools()).tools, [tool]);
 });
 
+test('offline and live native schemas share the same public receipt contract', async (t) => {
+  const definitions = operationTools([tool]);
+  const runtime = new SyntheticRuntime();
+  runtime.tools = () => definitions;
+  const connection = await memoryClient(runtime);
+  t.after(() => connection.close());
+  assert.deepEqual((await connection.client.listTools()).tools, definitions);
+  assert(definitions[0]!.inputSchema.required!.includes('request_id'));
+  assert.equal(definitions.length, 3);
+  assert.equal(tool.inputSchema.properties.request_id, undefined);
+});
+
+test('initialization shares stable guidance for files, interrupted operations and native dates', async (t) => {
+  const connection = await memoryClient(new SyntheticRuntime());
+  t.after(() => connection.close());
+  assert.equal(connection.client.getInstructions(), SERVER_INSTRUCTIONS);
+  for (const fact of [
+    'openai/fileParams',
+    'himalaya_mcp_operation_status',
+    'Sent verification',
+    'after D excludes D',
+    'not delivery to the recipient',
+  ])
+    assert(SERVER_INSTRUCTIONS.includes(fact), fact);
+});
+
+test('an uncertain native outcome is a receipt, not a failed-send error verdict', async (t) => {
+  const runtime = new SyntheticRuntime();
+  const connection = await memoryClient({
+    ...runtime,
+    tools: () => [tool],
+    listResources: () => [],
+    readResource: (uri: string) => runtime.readResource(uri),
+    close: () => runtime.close(),
+    callTool: async () => ({
+      operation: {
+        id: 'a'.repeat(64),
+        tool: tool.name,
+        state: 'unknown' as const,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        inputSha256: 'b'.repeat(64),
+      },
+      summary: 'Remote action may have completed; do not retry.',
+    }),
+  });
+  t.after(() => connection.close());
+  const response = await connection.client.callTool({ name: tool.name, arguments: {} });
+  assert.equal(response.isError, false);
+  assert.equal(
+    (response.structuredContent as { operation: { state: string } }).operation.state,
+    'unknown',
+  );
+});
+
+test('the SDK preserves generated OpenAI file metadata and structured file objects', async (t) => {
+  const generated = buildTools(
+    catalog([
+      command([argument('attach', { action: 'Append', valueType: 'path' })], ['message', 'send']),
+    ]),
+    { schemaVersion: 1, rules: [{ commands: ['**'], args: { attach: 'inputFile' } }] },
+  );
+  const runtime = new SyntheticRuntime();
+  runtime.tools = () => generated;
+  const connection = await memoryClient(runtime);
+  t.after(() => connection.close());
+  const listed = (await connection.client.listTools()).tools;
+  assert.deepEqual(listed, generated);
+  assert.deepEqual(listed[0]?._meta?.['openai/fileParams'], ['attach']);
+  const input = {
+    attach: [
+      {
+        download_url: 'https://files.example.invalid/original',
+        file_id: 'fixture-id',
+        file_name: '原图.jpeg',
+      },
+    ],
+  };
+  await connection.client.callTool({ name: generated[0]!.name, arguments: input });
+  assert.deepEqual(runtime.calls, [{ name: generated[0]!.name, input }]);
+});
+
 test('MCP passes structured parameters and binary inputs intact and returns native status', async (t) => {
   const runtime = new SyntheticRuntime();
   const connection = await memoryClient(runtime);
   t.after(() => connection.close());
   const input: CallInput = {
     params: { account: 'x; $(printf untouched) `unchanged` "quotes"\n中文' },
-    stdinBase64: Buffer.from([0, 13, 10, 255]).toString('base64'),
-    files: [{ name: 'attachment.bin', base64: Buffer.from([255, 0, 1]).toString('base64') }],
   };
   const result = await connection.client.callTool({ name: tool.name, arguments: { ...input } });
   assert.deepEqual(runtime.calls, [{ name: tool.name, input }]);
@@ -224,7 +305,8 @@ test(
     await client.connect(new StreamableHTTPClientTransport(new URL(handle.url!)));
     assert.deepEqual((await client.listTools()).tools, [tool]);
     assert.equal(
-      (await client.callTool({ name: tool.name, arguments: { stdin: 'synthetic mail' } })).isError,
+      (await client.callTool({ name: tool.name, arguments: { params: { account: 'synthetic' } } }))
+        .isError,
       false,
     );
     // Per-request SDK factories must not close the shared runtime after each response.

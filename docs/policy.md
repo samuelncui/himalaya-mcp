@@ -1,6 +1,6 @@
 # User-owned dangerous-operation policy
 
-By default, every runnable native command is registered and available. `--policy /absolute/path/to/policy.yaml` loads only the external YAML that the user selects. Repository examples are neither an exhaustive danger catalog nor a default policy.
+The generated catalog retains every runnable native command. An instance exposes those with usable backend/terminal requirements; whole-command exclusions are omitted from tools/list and blocked on direct calls. Conditional exclusions remain advertised because permitted calls still exist. `--policy /absolute/path/to/policy.yaml` loads only the external YAML that the user selects. Repository examples are neither an exhaustive danger catalog nor a default policy.
 
 A small example:
 
@@ -30,7 +30,7 @@ deny:
 
 That example illustrates matching a generated boolean ID, not a recommendation to approve other expunge modes. `when` accepts scalars or arrays of candidate scalar values. Current conditional rules require explicitly supplied, safely normalized boolean/count/integer arguments. If a relevant argument is omitted or depends on opaque native string parsing, execution reports `policy_unresolved`; it does not guess defaults, remote mailbox roles, or API behavior. Conditions compare MCP inputs; they do not interpret hidden native parser transformations. Recheck conditional rules when upgrading. Prefer a command-level rule when native state cannot be established. A mixed reversible/irreversible command may consequently need broader exclusion; that choice belongs to the user.
 
-The policy does not analyze raw IMAP/JMAP/API payloads or discover equivalent actions across other command paths. A rule covering one command cannot guarantee that another protocol entry point lacks the same effect. The user owns those exclusions. Newly discovered commands remain executable; unknown effects do not revive a project allowlist.
+The policy does not analyze raw IMAP/JMAP/API payloads or discover equivalent actions across other command paths. A rule covering one command cannot guarantee that another protocol entry point lacks the same effect. The user owns those exclusions. Newly discovered commands remain executable when the instance can support them; unknown effects do not revive a project allowlist.
 
 ## Approval and annotations are different
 

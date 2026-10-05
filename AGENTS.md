@@ -9,6 +9,7 @@ This project exposes the original Himalaya CLI through MCP. Keep the adapter sma
 - User policy is authoritative. Examples are opt-in; do not install, broaden, or overwrite a user's policy.
 - Preserve unknown information as unknown. Native Himalaya validates business values and argument conflicts. Do not invent native defaults or silently omit unsupported CLI syntax.
 - Do not put credentials, real account configuration, or email content in source control, CI, fixtures, or logs. Tests use synthetic mail and temporary directories.
+- Keep shared client workflow guidance in `src/instructions.ts`; gateways forward the initialized instructions instead of duplicating file or send-verification guidance in every generated Help.
 - Keep TypeScript strict and errors actionable. Avoid shell execution and automatic retries of writes.
 - Run `npm run check`, the native argument differential check, and the packed-package smoke check. Report platform or client checks that did not run.
 - Delegate substantial independent work with explicit ownership; the integrating agent reviews actual changes and runs combined checks. Do not let agents write the same files concurrently.

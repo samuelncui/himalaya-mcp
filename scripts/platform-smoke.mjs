@@ -88,7 +88,7 @@ export async function platformSmoke({ archive, expectedPlatform, expectedArch })
         /^[A-Za-z]:[\\/]/,
         'Windows smoke must exercise an actual drive-qualified config path',
       );
-    await writeFile(config, '', { mode: 0o600 });
+    await writeFile(config, '[accounts]\n', { mode: 0o600 });
     const environment = Object.fromEntries(
       Object.entries(process.env).filter(
         ([key, value]) => typeof value === 'string' && key.toLowerCase() !== 'himalaya_config',
@@ -102,6 +102,8 @@ export async function platformSmoke({ archive, expectedPlatform, expectedArch })
       cacheDir,
       '--workspace-dir',
       join(directory, 'calls'),
+      '--operation-dir',
+      join(directory, 'operations'),
     ];
     const description = JSON.parse(
       (
@@ -126,8 +128,8 @@ export async function platformSmoke({ archive, expectedPlatform, expectedArch })
     );
     assert.equal(
       description.tools.length,
-      catalog.commands.filter((command) => command.runnable).length,
-      'Every runnable CLI command must appear in describe',
+      catalog.commands.filter((command) => command.runnable).length + 2,
+      'Every runnable CLI definition and both operation tools must appear in describe',
     );
     const before = await runCommand(process.execPath, [cli, 'doctor', '--json', ...args], {
       cwd: directory,
@@ -156,25 +158,42 @@ export async function platformSmoke({ archive, expectedPlatform, expectedArch })
     });
     await client.connect(transport, { timeout: 90_000 });
     const listing = await client.listTools();
-    assert.deepEqual(
-      listing.tools,
-      description.tools,
-      'MCP must preserve all generated schemas, Help and annotations',
+    for (const tool of listing.tools.filter(
+      (tool) => !tool.name.startsWith('himalaya_mcp_operation'),
+    )) {
+      const generated = description.tools.find((candidate) => candidate.name === tool.name);
+      assert(generated, 'Runtime cannot invent a native command');
+      assert.deepEqual(tool.annotations, generated.annotations);
+      assert.deepEqual(tool._meta, generated._meta);
+      assert.deepEqual(tool.inputSchema.properties.params, generated.inputSchema.properties.params);
+      for (const field of generated._meta?.['openai/fileParams'] ?? [])
+        assert.deepEqual(
+          tool.inputSchema.properties[field],
+          generated.inputSchema.properties[field],
+        );
+      assert(tool.description.includes(generated.description));
+      assert(tool.inputSchema.required.includes('request_id'));
+    }
+    assert(listing.tools.some((tool) => tool.name === 'himalaya_mcp_operation_status'));
+    assert(
+      !listing.tools.some((tool) => tool.name === 'himalaya_imap_message_send'),
+      'Unconfigured backend must be absent',
     );
-    const nativeRoot = catalog.commands.find(
-      (command) => command.runnable && command.path.length === 0,
+    const nativeCommand = catalog.commands.find(
+      (command) => command.path.join(' ') === 'account list',
     );
-    const help = nativeRoot?.args.find((arg) =>
+    const help = nativeCommand.args.find((arg) =>
       ['Help', 'HelpShort', 'HelpLong'].includes(arg.action),
     );
-    assert(help, 'Native root Help must remain generically callable');
+    assert(help, 'Native Help must remain generically callable');
     const result = await client.callTool({
-      name: 'himalaya',
-      arguments: { params: { [help.id]: true } },
+      name: 'himalaya_account_list',
+      arguments: { request_id: 'platform-help-request', params: { [help.id]: true } },
     });
-    assert.equal(result.isError, false, 'Generic native root Help failed: ' + logs);
-    assert.equal(result.structuredContent?.exitCode, 0);
-    assert.match(result.structuredContent?.stdout ?? '', /Usage: himalaya/);
+    assert.equal(result.isError, false, 'Generic native Help failed: ' + logs);
+    assert.equal(result.structuredContent?.operation.state, 'succeeded');
+    assert.equal(result.structuredContent?.result.exitCode, 0);
+    assert.match(result.structuredContent?.result.stdout ?? '', /Usage: himalaya/);
     await client.close();
     client = undefined;
     transport = undefined;
@@ -234,7 +253,7 @@ export async function platformSmoke({ archive, expectedPlatform, expectedArch })
             'official first download',
             'verified cache reuse',
             'native version/help',
-            'MCP schema/list/root-help',
+            'MCP available schemas/receipts/native Help',
             'loopback complex MIME/envelope/Bcc/attachments',
             ...(process.platform === 'win32'
               ? ['native config drive path survives Clap delimiter parsing']
