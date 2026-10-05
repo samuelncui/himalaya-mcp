@@ -119,6 +119,71 @@ function recordValid(value: unknown, id: string): value is OperationRecord {
   );
 }
 
+/** Public schema decoration is pure, shared by offline inspection and live tools/list. */
+export function operationTools(tools: ToolDefinition[]): ToolDefinition[] {
+  return [
+    ...tools.map((tool) => {
+      if (
+        tool.name === STATUS ||
+        tool.name === LIST ||
+        Object.hasOwn(tool.inputSchema.properties, 'request_id')
+      )
+        throw new AdapterError(
+          'operation_definition',
+          'A native definition collides with operation tracking.',
+        );
+      return {
+        ...tool,
+        description: `Required request_id: reuse only with identical inputs while its receipt is retained (up to 24 hours / 128 records). Save operation.id; use himalaya_mcp_operation_status or himalaya_mcp_operations_list after an interrupted response.\n\n${tool.description}`,
+        inputSchema: {
+          ...tool.inputSchema,
+          properties: {
+            ...tool.inputSchema.properties,
+            request_id: {
+              type: 'string',
+              minLength: 8,
+              maxLength: 128,
+              pattern: '^[A-Za-z0-9_-]+$',
+              description:
+                'Stable unique ID for this intended operation, reused only with identical inputs.',
+            },
+          },
+          required: [...(tool.inputSchema.required ?? []), 'request_id'],
+        },
+      };
+    }),
+    {
+      name: STATUS,
+      description:
+        'Read the durable receipt and any retained native output for operation.id. Succeeded is confirmed by native exit status, not recipient delivery; unknown and missing/expired history must not trigger a retry. A receipt can survive an interrupted client response; output may expire or be absent after restart.',
+      inputSchema: {
+        type: 'object',
+        properties: { id: { type: 'string', pattern: '^[a-f0-9]{64}$' } },
+        required: ['id'],
+        additionalProperties: false,
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    {
+      name: LIST,
+      description:
+        'List recent operation receipts when an interrupted response lost operation.id. Receipts contain tool name, times, state, and input hash; not message content or file URLs. Native exit 0 does not prove recipient delivery. Unknown or expired/missing history never justifies resending merely because a client response was lost.',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+  ];
+}
+
 /** Owns durable receipts and deduplication only; the native runtime owns all execution. */
 export class OperationRuntime implements McpRuntime {
   private readonly directory: string;
@@ -411,67 +476,7 @@ export class OperationRuntime implements McpRuntime {
     await this.ready();
     if (this.closed) throw new AdapterError('runtime_closed', 'The server is closing.');
     const tools = await this.native.tools();
-    return [
-      ...tools.map((tool) => {
-        if (
-          tool.name === STATUS ||
-          tool.name === LIST ||
-          Object.hasOwn(tool.inputSchema.properties, 'request_id')
-        )
-          throw new AdapterError(
-            'operation_definition',
-            'A native definition collides with operation tracking.',
-          );
-        return {
-          ...tool,
-          description: `Required request_id: reuse only with identical inputs while its receipt is retained (up to 24 hours / 128 records). Save operation.id; use himalaya_mcp_operation_status or himalaya_mcp_operations_list after an interrupted response.\n\n${tool.description}`,
-          inputSchema: {
-            ...tool.inputSchema,
-            properties: {
-              ...tool.inputSchema.properties,
-              request_id: {
-                type: 'string',
-                minLength: 8,
-                maxLength: 128,
-                pattern: '^[A-Za-z0-9_-]+$',
-                description:
-                  'Stable unique ID for this intended operation, reused only with identical inputs.',
-              },
-            },
-            required: [...(tool.inputSchema.required ?? []), 'request_id'],
-          },
-        };
-      }),
-      {
-        name: STATUS,
-        description:
-          'Read the durable receipt and any retained native output for operation.id. Succeeded is confirmed by native exit status, not recipient delivery; unknown and missing/expired history must not trigger a retry. A receipt can survive an interrupted client response; output may expire or be absent after restart.',
-        inputSchema: {
-          type: 'object',
-          properties: { id: { type: 'string', pattern: '^[a-f0-9]{64}$' } },
-          required: ['id'],
-          additionalProperties: false,
-        },
-        annotations: {
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false,
-        },
-      },
-      {
-        name: LIST,
-        description:
-          'List recent operation receipts when an interrupted response lost operation.id. Receipts contain tool name, times, state, and input hash; not message content or file URLs. Native exit 0 does not prove recipient delivery. Unknown or expired/missing history never justifies resending merely because a client response was lost.',
-        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-        annotations: {
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false,
-        },
-      },
-    ];
+    return operationTools(tools);
   }
 
   private response(id: string): OperationResponse {

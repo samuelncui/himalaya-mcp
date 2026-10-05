@@ -1,6 +1,6 @@
 # Calling the generated CLI tools
 
-Read the common instructions returned during MCP initialization, then use `tools/list` for the tools actually available in this deployment, including native Help and the generated input schema. The initialization instructions own file-channel and uncertain-write guidance independently of automatically exported CLI Help. `himalaya-mcp describe --json` also exposes generated definitions without executing mail operations. Keys under `params` are upstream Clap **argument IDs**, which may differ from flag spelling. Do not infer parameter names or maintain another command registry.
+Read the common instructions returned during MCP initialization, then use `tools/list` for the tools actually available in this deployment, including native Help and the generated input schema. The initialization instructions own file-channel and uncertain-write guidance independently of automatically exported CLI Help. `himalaya-mcp describe --json` also exposes potential public schemas and the same instructions without executing mail operations; only live tools/list establishes instance availability. Keys under `params` are upstream Clap **argument IDs**, which may differ from flag spelling. Do not infer parameter names or maintain another command registry.
 
 ## Structured arguments
 

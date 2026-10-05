@@ -17,6 +17,7 @@ import type { ReadResourceResult, Resource } from '@modelcontextprotocol/server'
 import { loadBundle, parseOptions, runCli } from '../src/cli.js';
 import { createMcpServer, startHttp, startStdio, type McpRuntime } from '../src/mcp.js';
 import { SERVER_INSTRUCTIONS } from '../src/instructions.js';
+import { operationTools } from '../src/operations.js';
 import { buildTools } from '../src/catalog.js';
 import { argument, catalog, command } from './fixtures.js';
 import {
@@ -114,6 +115,18 @@ test('MCP preserves generated Help, schemas, annotations, and the complete regis
   const connection = await memoryClient(new SyntheticRuntime());
   t.after(() => connection.close());
   assert.deepEqual((await connection.client.listTools()).tools, [tool]);
+});
+
+test('offline and live native schemas share the same public receipt contract', async (t) => {
+  const definitions = operationTools([tool]);
+  const runtime = new SyntheticRuntime();
+  runtime.tools = () => definitions;
+  const connection = await memoryClient(runtime);
+  t.after(() => connection.close());
+  assert.deepEqual((await connection.client.listTools()).tools, definitions);
+  assert(definitions[0]!.inputSchema.required!.includes('request_id'));
+  assert.equal(definitions.length, 3);
+  assert.equal(tool.inputSchema.properties.request_id, undefined);
 });
 
 test('initialization shares stable guidance for files, interrupted operations and native dates', async (t) => {

@@ -128,8 +128,8 @@ export async function platformSmoke({ archive, expectedPlatform, expectedArch })
     );
     assert.equal(
       description.tools.length,
-      catalog.commands.filter((command) => command.runnable).length,
-      'Every runnable CLI command must appear in describe',
+      catalog.commands.filter((command) => command.runnable).length + 2,
+      'Every runnable CLI definition and both operation tools must appear in describe',
     );
     const before = await runCommand(process.execPath, [cli, 'doctor', '--json', ...args], {
       cwd: directory,

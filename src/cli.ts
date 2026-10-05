@@ -9,7 +9,8 @@ import { parseArgs } from 'node:util';
 import { ensureBinary, inspectBinary } from './binary.js';
 import { buildTools } from './catalog.js';
 import { errorMessage, startHttp, startStdio, type RunningServer } from './mcp.js';
-import { OperationRuntime } from './operations.js';
+import { operationTools, OperationRuntime } from './operations.js';
+import { SERVER_INSTRUCTIONS } from './instructions.js';
 import { loadPolicy } from './policy.js';
 import { Runtime } from './runtime.js';
 import { AdapterError, type Catalog, type Manifest, type Profiles } from './types.js';
@@ -33,7 +34,8 @@ const HELP = `Usage: himalaya-mcp [serve | doctor | describe] [options]
 serve     Start the MCP server (default).
 doctor    Check published metadata, local binary, and explicit config/policy paths.
           Never downloads a binary or connects to an email account.
-describe  List the generated MCP tools and native Help without running Himalaya.
+describe  Show potential MCP definitions and shared instructions without running Himalaya.
+          Live tools/list filters these for this instance.
 
 Options:
   --transport stdio|http  Transport (default: stdio)
@@ -245,10 +247,10 @@ export async function runCli(argv: string[], directory?: URL): Promise<number> {
       return 0;
     }
     if (options.command === 'describe') {
-      const tools = buildTools(bundle.catalog, bundle.profiles);
+      const tools = operationTools(buildTools(bundle.catalog, bundle.profiles));
       process.stdout.write(
         options.json
-          ? `${JSON.stringify({ tools }, null, 2)}\n`
+          ? `${JSON.stringify({ availability: 'potential definitions; use live tools/list for instance availability', instructions: SERVER_INSTRUCTIONS, tools }, null, 2)}\n`
           : `${tools.map((tool) => `${tool.name}\n${tool.description}`).join('\n\n')}\n`,
       );
       return 0;
