@@ -121,6 +121,27 @@ function recordValid(value: unknown, id: string): value is OperationRecord {
 
 /** Public schema decoration is pure, shared by offline inspection and live tools/list. */
 export function operationTools(tools: ToolDefinition[]): ToolDefinition[] {
+  const statusSchema = {
+    type: 'object' as const,
+    properties: {
+      id: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+      request_id: {
+        type: 'string',
+        minLength: 8,
+        maxLength: 128,
+        pattern: '^[A-Za-z0-9_-]+$',
+        description: 'Original request_id from the intended operation; querying never executes it.',
+      },
+      include_result: {
+        type: 'boolean',
+        default: true,
+        description:
+          'Set false to read receipt metadata and summary without returning native output.',
+      },
+    },
+    oneOf: [{ required: ['id'] }, { required: ['request_id'] }],
+    additionalProperties: false as const,
+  };
   return [
     ...tools.map((tool) => {
       if (
@@ -134,7 +155,7 @@ export function operationTools(tools: ToolDefinition[]): ToolDefinition[] {
         );
       return {
         ...tool,
-        description: `Required request_id: reuse only with identical inputs while its receipt is retained (up to 24 hours / 128 records). Save operation.id; use himalaya_mcp_operation_status or himalaya_mcp_operations_list after an interrupted response.\n\n${tool.description}`,
+        description: `Required request_id: reuse only with identical inputs while its receipt is retained (up to 24 hours / 128 records). Retain request_id before submitting; query himalaya_mcp_operation_status by request_id if the initial response is lost.\n\n${tool.description}`,
         inputSchema: {
           ...tool.inputSchema,
           properties: {
@@ -155,13 +176,8 @@ export function operationTools(tools: ToolDefinition[]): ToolDefinition[] {
     {
       name: STATUS,
       description:
-        'Read the durable receipt and any retained native output for operation.id. Succeeded is confirmed by native exit status, not recipient delivery; unknown and missing/expired history must not trigger a retry. A receipt can survive an interrupted client response; output may expire or be absent after restart.',
-      inputSchema: {
-        type: 'object',
-        properties: { id: { type: 'string', pattern: '^[a-f0-9]{64}$' } },
-        required: ['id'],
-        additionalProperties: false,
-      },
+        'Read a durable receipt using exactly one of the returned operation.id or the original request_id, including when the initial response was lost. Querying never executes or retries the operation. Use include_result=false for completion checks without large native output; omitted or true includes any retained result. Succeeded confirms native exit status, not recipient delivery; unknown and missing/expired history must not trigger a retry. Output may expire or be absent after restart.',
+      inputSchema: statusSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -172,7 +188,7 @@ export function operationTools(tools: ToolDefinition[]): ToolDefinition[] {
     {
       name: LIST,
       description:
-        'List recent operation receipts when an interrupted response lost operation.id. Receipts contain tool name, times, state, and input hash; not message content or file URLs. Native exit 0 does not prove recipient delivery. Unknown or expired/missing history never justifies resending merely because a client response was lost.',
+        'List recent operation receipts when both operation.id and the original request_id are unavailable. Receipts contain tool name, times, state, and input hash; not message content or file URLs. Native exit 0 does not prove recipient delivery. Unknown or expired/missing history never justifies resending merely because a client response was lost.',
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       annotations: {
         readOnlyHint: true,
@@ -479,11 +495,11 @@ export class OperationRuntime implements McpRuntime {
     return operationTools(tools);
   }
 
-  private response(id: string): OperationResponse {
+  private response(id: string, includeResult = true): OperationResponse {
     const record = this.records.get(id);
     if (!record)
       throw new AdapterError('operation_missing', 'Operation receipt is missing or expired.');
-    const result = this.results.get(id)?.result;
+    const result = includeResult ? this.results.get(id)?.result : undefined;
     return {
       operation: { ...record },
       summary:
@@ -496,7 +512,7 @@ export class OperationRuntime implements McpRuntime {
               : 'The durable receipt is saved; native completion is pending. Query operation status instead of submitting another operation.',
       ...(result
         ? { result: structuredClone(result) }
-        : terminal(record)
+        : includeResult && terminal(record)
           ? {
               resultUnavailable:
                 record.state === 'not_executed'
@@ -524,12 +540,35 @@ export class OperationRuntime implements McpRuntime {
               .map((record) => ({ ...record })),
           } satisfies OperationListResponse;
         }
-        if (Object.keys(raw).length !== 1 || typeof raw.id !== 'string' || !ID.test(raw.id))
+        if (Object.keys(raw).some((key) => !['id', 'request_id', 'include_result'].includes(key)))
+          throw new AdapterError(
+            'operation_input',
+            'Operation status accepts only id, request_id, and include_result.',
+          );
+        const hasId = Object.hasOwn(raw, 'id');
+        const hasRequestId = Object.hasOwn(raw, 'request_id');
+        if (hasId === hasRequestId)
+          throw new AdapterError(
+            'operation_input',
+            'Operation status requires exactly one operation.id or request_id.',
+          );
+        if (hasId && (typeof raw.id !== 'string' || !ID.test(raw.id)))
           throw new AdapterError(
             'operation_input',
             'Operation status requires a valid operation.id.',
           );
-        return this.response(raw.id);
+        if (
+          hasRequestId &&
+          (typeof raw.request_id !== 'string' || !REQUEST_ID.test(raw.request_id))
+        )
+          throw new AdapterError(
+            'operation_input',
+            'Operation status requires request_id: 8..128 letters, digits, underscores, or hyphens.',
+          );
+        if (Object.hasOwn(raw, 'include_result') && typeof raw.include_result !== 'boolean')
+          throw new AdapterError('operation_input', 'include_result must be a boolean.');
+        const id = hasId ? (raw.id as string) : digest(raw.request_id as string);
+        return this.response(id, raw.include_result !== false);
       });
     if (typeof raw.request_id !== 'string' || !REQUEST_ID.test(raw.request_id))
       throw new AdapterError(

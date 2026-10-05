@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import type { ReadResourceResult, Resource } from '@modelcontextprotocol/server';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import { Ajv } from 'ajv';
 import { startHttp, type McpRuntime } from '../src/mcp.js';
 import { OperationRuntime } from '../src/operations.js';
 import {
@@ -161,8 +162,30 @@ test('native tool schemas require request IDs without losing generated file meta
     const tool = tools.find((item) => item.name === name)!;
     assert.equal(tool.annotations.readOnlyHint, true);
     assert.equal(tool.annotations.destructiveHint, false);
-    assert.equal(tool.inputSchema.properties.request_id, undefined);
   }
+  assert.equal(
+    tools.find((tool) => tool.name === LIST)!.inputSchema.properties.request_id,
+    undefined,
+  );
+  const status = tools.find((tool) => tool.name === STATUS)!;
+  const validate = new Ajv().compile(status.inputSchema);
+  for (const input of [
+    { id: 'a'.repeat(64) },
+    { request_id: 'A0_b-cDe' },
+    { request_id: 'x'.repeat(128), include_result: false },
+    { id: 'a'.repeat(64), include_result: true },
+  ])
+    assert.equal(validate(input), true, JSON.stringify(validate.errors));
+  for (const input of [
+    {},
+    { id: 'a'.repeat(64), request_id: 'valid-request' },
+    { request_id: 'short' },
+    { request_id: 'x'.repeat(129) },
+    { id: 'A'.repeat(64) },
+    { id: 'a'.repeat(64), include_result: 'false' },
+    { request_id: 'valid-request', tool: NAME },
+  ])
+    assert.equal(validate(input), false, JSON.stringify(input));
 });
 
 test('success persists metadata only and duplicate input order does not execute again', async (t) => {
@@ -248,6 +271,104 @@ test('slow calls return receipts and status/list recover an interrupted response
   assert.deepEqual(success.result, native.result);
 });
 
+test('a lost initial receipt is recovered directly by request ID without native inputs', async (t) => {
+  const { native, runtime } = await context(t, 0);
+  native.gate = deferred();
+  const requestId = 'lost-initial-receipt';
+  await runtime.callTool(NAME, { request_id: requestId, params: { body: 'synthetic message' } });
+  await native.started.promise;
+  const pending = receipt(
+    await runtime.callTool(STATUS, { request_id: requestId, include_result: false }),
+  );
+  assert.ok(['accepted', 'executing'].includes(pending.operation.state));
+  assert.equal(pending.operation.id, hash(requestId));
+  assert.equal(pending.result, undefined);
+  assert.equal(pending.resultUnavailable, undefined);
+  native.gate.resolve();
+  const success = await completed(runtime, pending.operation.id);
+  const byRequest = receipt(await runtime.callTool(STATUS, { request_id: requestId }));
+  const explicit = receipt(
+    await runtime.callTool(STATUS, { request_id: requestId, include_result: true }),
+  );
+  assert.deepEqual(byRequest, success);
+  assert.deepEqual(explicit, success);
+  assert.equal(native.calls.length, 1);
+  assert.equal(native.executions, 1);
+});
+
+test('metadata-only status omits large results without evicting or reporting them unavailable', async (t) => {
+  const { native, runtime } = await context(t);
+  native.result = {
+    exitCode: 0,
+    stdout: 'synthetic large output'.repeat(64 * 1024),
+    stderr: '',
+    files: [],
+  };
+  const requestId = 'large-metadata-only';
+  const full = receipt(await runtime.callTool(NAME, { request_id: requestId }));
+  for (const lookup of [{ id: full.operation.id }, { request_id: requestId }]) {
+    const metadata = receipt(await runtime.callTool(STATUS, { ...lookup, include_result: false }));
+    assert.deepEqual(metadata, { operation: full.operation, summary: full.summary });
+    assert.ok(JSON.stringify(metadata).length < 1024);
+  }
+  assert.deepEqual(receipt(await runtime.callTool(STATUS, { id: full.operation.id })), full);
+  assert.equal(native.calls.length, 1);
+});
+
+test('status query validates exclusive identifiers, flags, and unknown keys before native work', async (t) => {
+  const { native, runtime } = await context(t);
+  const id = 'a'.repeat(64);
+  const requestId = 'query-original-001';
+  const invalid: CallInput[] = [
+    {},
+    { include_result: false },
+    { id, request_id: requestId },
+    { id: undefined, request_id: requestId },
+    { id: null },
+    { id: 1 },
+    { id: 'a'.repeat(63) },
+    { id: 'a'.repeat(65) },
+    { id: 'A'.repeat(64) },
+    { request_id: undefined },
+    { request_id: null },
+    { request_id: 1 },
+    { request_id: 'x'.repeat(7) },
+    { request_id: 'x'.repeat(129) },
+    { request_id: 'has space' },
+    { request_id: '../record' },
+    { request_id: 'line\nrequest' },
+    { id, include_result: undefined },
+    { id, include_result: 'false' },
+    { id, include_result: null },
+    { id, include_result: 0 },
+    { id, include_result: 1 },
+    { id, extra: true },
+    { request_id: requestId, tool: NAME },
+    { id, params: {} },
+  ];
+  for (const input of invalid) {
+    await assert.rejects(
+      runtime.callTool(STATUS, input),
+      (error: unknown) => error instanceof AdapterError && error.code === 'operation_input',
+    );
+  }
+  for (const lookup of [{ id }, { request_id: requestId, include_result: false }])
+    await assert.rejects(runtime.callTool(STATUS, lookup), /missing or expired/);
+  assert.equal(native.calls.length, 0);
+  assert.deepEqual(((await runtime.callTool(LIST, {})) as OperationListResponse).operations, []);
+});
+
+test('status request IDs accept the native length boundaries without creating another operation', async (t) => {
+  const { native, runtime } = await context(t);
+  for (const requestId of ['A0_b-cDe', 'x'.repeat(128)]) {
+    const original = receipt(await runtime.callTool(NAME, { request_id: requestId }));
+    const lookup = receipt(await runtime.callTool(STATUS, { request_id: requestId }));
+    assert.deepEqual(lookup, original);
+  }
+  assert.equal(native.executions, 2);
+  assert.equal(native.calls.length, 2);
+});
+
 test('pre-execution errors differ from uncertain errors after the durable execution barrier', async (t) => {
   const before = await context(t);
   before.native.beforeFailure = new AdapterError('input_file', 'private synthetic detail');
@@ -311,10 +432,10 @@ test('live ownership fails closed without altering another runtime history', asy
 
 test('restart converts abandoned accepted/executing to unknown and never replays inputs', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'himalaya-restart-'));
-  const original = [
-    stored('abandoned-accepted', 'accepted'),
-    stored('abandoned-executing', 'executing'),
-  ];
+  const requestIds = ['abandoned-accepted', 'abandoned-executing'];
+  const original = requestIds.map((requestId, index) =>
+    stored(requestId, index === 0 ? 'accepted' : 'executing'),
+  );
   await writeRecords(directory, original);
   const native = new FakeRuntime();
   const runtime = new OperationRuntime(native, { directory });
@@ -323,11 +444,15 @@ test('restart converts abandoned accepted/executing to unknown and never replays
     await rm(directory, { recursive: true, force: true });
   });
   await runtime.ready();
-  for (const record of original) {
+  for (const [index, record] of original.entries()) {
     const restored = receipt(await runtime.callTool(STATUS, { id: record.id }));
     assert.equal(restored.operation.state, 'unknown');
     assert.equal(restored.operation.error, 'process_restart');
     assert.ok(restored.resultUnavailable);
+    const byRequest = receipt(
+      await runtime.callTool(STATUS, { request_id: requestIds[index]!, include_result: false }),
+    );
+    assert.deepEqual(byRequest, { operation: restored.operation, summary: restored.summary });
   }
   const replay = receipt(await runtime.callTool(NAME, { request_id: 'abandoned-accepted' }));
   assert.equal(replay.operation.state, 'unknown');
@@ -568,7 +693,7 @@ test(
   },
 );
 
-test('HTTP client reconnect retrieves a slow operation after losing the first connection', async (t) => {
+test('HTTP client reconnect recovers by request ID after losing the entire initial reply', async (t) => {
   const { native, runtime } = await context(t, 2000);
   native.gate = deferred();
   let finish: ReturnType<typeof setTimeout> | undefined;
@@ -586,27 +711,38 @@ test('HTTP client reconnect retrieves a slow operation after losing the first co
   });
   await first.connect(new StreamableHTTPClientTransport(new URL(server.url!)));
   const arguments_ = { request_id: 'http-reconnect-001', params: {} };
-  const pending = await first.callTool({ name: NAME, arguments: arguments_ });
-  assert.equal(pending.isError, false);
-  const initial = receipt(pending.structuredContent as unknown as McpCallResult);
-  assert.ok(['accepted', 'executing'].includes(initial.operation.state));
+  const initial = first.callTool({ name: NAME, arguments: arguments_ }).then(
+    () => 'received',
+    () => 'lost',
+  );
+  await native.started.promise;
   await first.close();
+  assert.equal(await initial, 'lost');
   assert.equal(native.closes, 0);
   await second.connect(new StreamableHTTPClientTransport(new URL(server.url!)));
   let final: OperationResponse | undefined;
   for (let attempt = 0; attempt < 100; attempt++) {
-    const wire = await second.callTool({ name: STATUS, arguments: { id: initial.operation.id } });
+    const wire = await second.callTool({
+      name: STATUS,
+      arguments: { request_id: arguments_.request_id, include_result: false },
+    });
     final = receipt(wire.structuredContent as unknown as McpCallResult);
+    assert.equal(final.result, undefined);
+    assert.equal(final.resultUnavailable, undefined);
     if (final.operation.state === 'succeeded') break;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.ok(final);
   assert.equal(final.operation.state, 'succeeded');
-  assert.deepEqual(final.result, native.result);
+  const withOutput = await second.callTool({ name: STATUS, arguments: { id: final.operation.id } });
+  assert.deepEqual(
+    receipt(withOutput.structuredContent as unknown as McpCallResult).result,
+    native.result,
+  );
   const duplicate = await second.callTool({ name: NAME, arguments: arguments_ });
   assert.equal(
     receipt(duplicate.structuredContent as unknown as McpCallResult).operation.id,
-    initial.operation.id,
+    final.operation.id,
   );
   assert.equal(native.executions, 1);
   assert.equal(native.calls.length, 1);

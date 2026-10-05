@@ -25,9 +25,20 @@ Every native tool requires a top-level `request_id`: 8–128 letters, digits, un
 The server persists a receipt before accepting native execution and persists `executing` immediately before launching Himalaya. It waits up to approximately two seconds for completion, then returns a receipt while a slow operation continues independently of that request's response. It does not save or replay inputs. An interrupted response therefore has two recovery paths:
 
 - If the receipt was received, call `himalaya_mcp_operation_status` with its `operation.id`.
-- If the response containing the ID was lost, call `himalaya_mcp_operations_list`, identify the recent operation by tool and time, and query its ID. Repeating the identical request with its original `request_id` also retrieves the retained operation instead of executing again.
+- If the initial response containing the ID was lost, query directly with the original `request_id`. No native inputs or file URLs are needed, and querying never executes the operation. Use `himalaya_mcp_operations_list` to identify a recent operation by tool and time only when both identifiers are unavailable.
 
-The operation ID is an opaque SHA-256 identifier; status calls accept only the returned 64-character hexadecimal value. The two tracking tools are read-only and do not require `request_id`.
+Status accepts **exactly one** of `id` (the returned 64-character lowercase hexadecimal operation ID) or the original `request_id` with the same 8–128-character rules. The server derives the operation ID from the request ID without storing it in plaintext. Both tracking tools are read-only; the listing tool takes no arguments.
+
+Prefer metadata-only completion checks, especially when native output may be large:
+
+```json
+{
+  "name": "himalaya_mcp_operation_status",
+  "arguments": { "request_id": "compose-photo-example-001", "include_result": false }
+}
+```
+
+`include_result` defaults to `true`, preserving the original status response with any retained native output. When false, the response contains only `operation` and `summary`; it does not include `result` or imply missing output through `resultUnavailable`. Explicitly request output when needed. An identical native request still retrieves the retained operation rather than executing again, but status lookup avoids resubmitting its inputs.
 
 | State          | What is known                                                                                        |
 | -------------- | ---------------------------------------------------------------------------------------------------- |
@@ -41,7 +52,7 @@ Each receipt response includes a plain-language `summary`. `accepted`, `executin
 
 Deduplication lasts only while the receipt is retained. Metadata is retained for up to 24 hours, with a maximum of 128 records; the oldest terminal records may be evicted sooner at capacity. Active records are not evicted to make space. A full history containing only active operations rejects new work before execution. Do not reuse a previous operation's `request_id` as a new-send strategy after history expires.
 
-Only metadata is persisted: operation ID, tool, state, timestamps, input hash, and safe error/exit summaries. Native inputs, file URLs, message bodies, and full output are not written into history. Complete native output is held only in this process, for at most one hour, eight results, and 64 MiB total. A receipt remains queryable when output is evicted or lost on restart; `resultUnavailable` explicitly explains that absence.
+Only metadata is persisted: operation ID, tool, state, timestamps, input hash, and safe error/exit summaries. Native inputs, file URLs, message bodies, and full output are not written into history. Complete native output is held only in this process, for at most one hour, eight results, and 64 MiB total. A receipt remains queryable when output is evicted or lost on restart; when output is requested, `resultUnavailable` explicitly explains that absence.
 
 Use `--operation-dir` for private persistent receipt metadata, separate from disposable call workspaces and credentials. One directory has exactly one live server owner. A diagnostic or another user instance must use its own operation directory. Owner metadata includes a process nonce and, on Linux, the boot/PID-namespace identity. A changed Linux scope or a reused current PID with an old nonce identifies a previous runtime; other live or unverifiable owners are refused. Legacy owner files without these identities require a confirmed dead PID. After an identified previous runtime, abandoned `accepted`/`executing` receipts become `unknown` and **are never replayed**. Stale-owner recovery uses an exclusive guard; an orphan recovery guard requires operator inspection after stopping all owners, rather than automatic removal. Graceful server shutdown closes native execution, settles its receipts, and then releases ownership. A request response ending is distinct from shutting down the server.
 
