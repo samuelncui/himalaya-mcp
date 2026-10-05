@@ -262,8 +262,8 @@ test('first publication and rebuilding that version produce identical report byt
   );
 });
 
-test('selects the greatest prior native/adapter release independently of latest or target presence', async () => {
-  const priorVersion = '2.2.1-adapter.0.1.0';
+test('selects the greatest supported prior release despite placeholders, latest or target presence', async () => {
+  const priorVersion = '2.2.1-adapter.0.1.1';
   const target = '2.2.1-adapter.0.2.0';
   const prior = catalog([command('old')]);
   const bytes = archive([{ path: catalogPath, body: JSON.stringify(prior) }]);
@@ -272,6 +272,8 @@ test('selects the greatest prior native/adapter release independently of latest 
     integrity: 'sha512-' + createHash('sha512').update(bytes).digest('base64'),
   };
   const versions = [
+    '0.0.0-stage',
+    '1.0.0',
     '2.2.0-adapter.9.9.9',
     '2.2.1-adapter.0.0.9',
     priorVersion,
@@ -285,7 +287,7 @@ test('selects the greatest prior native/adapter release independently of latest 
     }
     return Response.json({
       name: 'himalaya-mcp',
-      'dist-tags': { latest: includeTarget ? target : '2.3.0-adapter.0.0.0' },
+      'dist-tags': { latest: includeTarget ? target : '0.0.0-stage' },
       versions: Object.fromEntries(
         [...versions, ...(includeTarget ? [target] : [])].map((version) => [
           version,
@@ -305,8 +307,51 @@ test('selects the greatest prior native/adapter release independently of latest 
   );
 });
 
-test('unsupported or corrupt registry versions fail even when they would not be selected', async () => {
-  for (const version of ['1.0.0', '02.2.1-adapter.0.1.0', '2.2.1-adapter.0.1.0-beta']) {
+test('placeholder-only registry is an initial baseline with stable first-release report bytes', async () => {
+  const target = '2.2.1-adapter.0.1.1';
+  const candidateBytes = Buffer.from(JSON.stringify(catalog([command('send')])));
+  let requests = 0;
+  const previous = await publishedCatalog(
+    'himalaya-mcp',
+    async (url) => {
+      requests++;
+      assert(!url.endsWith('.tgz'), 'a bootstrap placeholder is not a catalog baseline');
+      return Response.json({
+        name: 'himalaya-mcp',
+        'dist-tags': { latest: '0.0.0-stage' },
+        versions: { '0.0.0-stage': { name: 'himalaya-mcp', version: '0.0.0-stage' } },
+      });
+    },
+    target,
+  );
+  assert.equal(requests, 1);
+  assert.equal(previous, undefined);
+  assert.equal(
+    JSON.stringify(catalogDiffReport('himalaya-mcp', candidateBytes, previous)),
+    JSON.stringify(catalogDiffReport('himalaya-mcp', candidateBytes, undefined)),
+  );
+});
+
+test('selected latest outside the supported release family still fails', async () => {
+  for (const version of ['0.0.0-stage', '1.0.0']) {
+    await assert.rejects(
+      publishedCatalog('himalaya-mcp', async () =>
+        Response.json({
+          name: 'himalaya-mcp',
+          'dist-tags': { latest: version },
+          versions: {
+            [version]: { name: 'himalaya-mcp', version },
+            '2.2.1-adapter.0.1.1': { name: 'himalaya-mcp', version: '2.2.1-adapter.0.1.1' },
+          },
+        }),
+      ),
+      /Unsupported npm release version/,
+    );
+  }
+});
+
+test('malformed adapter-family or corrupt registry entries fail even when not selected', async () => {
+  for (const version of ['02.2.1-adapter.0.1.0', '2.2.1-adapter.0.1.0-beta', '2.2.1-adapter.']) {
     await assert.rejects(
       publishedCatalog(
         'himalaya-mcp',
@@ -320,18 +365,18 @@ test('unsupported or corrupt registry versions fail even when they would not be 
       /Unsupported npm release version/,
     );
   }
-  await assert.rejects(
-    publishedCatalog(
-      'himalaya-mcp',
-      async () =>
-        Response.json({
-          name: 'himalaya-mcp',
-          versions: {
-            '2.2.1-adapter.0.1.0': { name: 'different-package', version: '2.2.1-adapter.0.1.0' },
-          },
-        }),
-      '2.2.1-adapter.0.1.0',
-    ),
-    /Invalid npm version metadata/,
-  );
+  for (const version of ['2.2.1-adapter.0.1.0', '0.0.0-stage']) {
+    await assert.rejects(
+      publishedCatalog(
+        'himalaya-mcp',
+        async () =>
+          Response.json({
+            name: 'himalaya-mcp',
+            versions: { [version]: { name: 'different-package', version } },
+          }),
+        '2.2.1-adapter.0.1.1',
+      ),
+      /Invalid npm version metadata/,
+    );
+  }
 });

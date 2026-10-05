@@ -235,13 +235,15 @@ export async function publishedCatalog(packageName, fetchImpl = fetch, target) {
   ) {
     throw new Error('Existing npm package has no valid version metadata.');
   }
-  const versions = Object.keys(metadata.versions);
-  for (const version of versions) {
-    supportedVersion(version);
-    const entry = metadata.versions[version];
+  const versions = [];
+  for (const [version, entry] of Object.entries(metadata.versions)) {
     if (!object(entry) || entry.name !== packageName || entry.version !== version) {
       throw new Error(`Invalid npm version metadata: ${version}.`);
     }
+    // Legacy/bootstrap versions are not part of the native-adapter release family.
+    if (!version.includes('-adapter.')) continue;
+    supportedVersion(version);
+    versions.push(version);
   }
   let packageVersion;
   if (target !== undefined) {
@@ -263,6 +265,7 @@ export async function publishedCatalog(packageName, fetchImpl = fetch, target) {
     if (typeof packageVersion !== 'string' || !Object.hasOwn(metadata.versions, packageVersion)) {
       throw new Error('Existing npm package has no valid latest version metadata.');
     }
+    supportedVersion(packageVersion);
   }
   const latest = metadata.versions[packageVersion];
   const integrity = latest.dist?.integrity;

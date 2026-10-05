@@ -9,6 +9,11 @@ on:
         type: string
         required: false
         default: ''
+      force:
+        description: 'Run the complete release even when Himalaya is unchanged (adapter fixes or acceptance testing)'
+        required: false
+        default: false
+        type: boolean
 permissions:
   contents: read
 concurrency:
@@ -16,15 +21,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  generation:
+  check:
     if: github.ref == 'refs/heads/main' && github.repository == 'samuelncui/himalaya-mcp'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      needed: ${{ steps.check.outputs.needed }}
+      version: ${{ steps.check.outputs.version }}
+    env:
+      NODE_OPTIONS: --use-system-ca
+      GITHUB_TOKEN: ${{ github.token }}
+      UPSTREAM_VERSION: ${{ inputs.version }}
+      FORCE_RELEASE: ${{ inputs.force || false }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Skip unchanged Himalaya before generation or publication
+        id: check
+        run: node scripts/release-check.mjs
+
+  generation:
+    needs: check
+    if: needs.check.outputs.needed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     outputs:
       artifact-id: ${{ steps.definitions.outputs.artifact-id }}
     env:
       NODE_OPTIONS: --use-system-ca
-      UPSTREAM_VERSION: ${{ inputs.version }}
+      UPSTREAM_VERSION: ${{ needs.check.outputs.version }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -173,7 +204,7 @@ jobs:
     needs: [package, platforms]
     if: github.ref == 'refs/heads/main' && github.repository == 'samuelncui/himalaya-mcp' && vars.NPM_TRUSTED_PUBLISHING_ENABLED == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     environment: npm
     permissions:
       contents: read
