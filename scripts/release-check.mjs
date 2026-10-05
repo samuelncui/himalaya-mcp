@@ -29,8 +29,7 @@ export async function checkRelease(
   if (published && (published.name !== packageName || typeof published.version !== 'string'))
     throw new Error('Published npm latest has invalid package identity.');
   const publishedVersion = published?.version;
-  const parts = publishedVersion?.split('-adapter.');
-  if (!published || parts.length === 1)
+  if (!published)
     return {
       needed: true,
       version,
@@ -38,6 +37,7 @@ export async function checkRelease(
       publishedVersion,
       reason: 'No published adapter native-version baseline.',
     };
+  const parts = publishedVersion.split('-adapter.');
   if (parts.length !== 2 || releaseVersion(parts[0], parts[1]) !== publishedVersion)
     throw new Error('Published npm latest is not a supported adapter release.');
   if (compareReleaseVersions(candidateVersion, publishedVersion) < 0)

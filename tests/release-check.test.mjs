@@ -25,13 +25,12 @@ test('unchanged Himalaya skips even when the adapter source version is newer', a
   assert.equal(result.candidateVersion, '2.2.1-adapter.0.1.2');
 });
 
-test('new Himalaya and missing/legacy native baselines require generation', async () => {
+test('new Himalaya and a missing npm package require generation', async () => {
   assert.equal(
     (await checkRelease(options, reader({ ...upstream, tag_name: 'v2.2.2' }))).needed,
     true,
   );
-  for (const pkg of [null, { name: options.packageName, version: '0.0.0-stage' }])
-    assert.equal((await checkRelease(options, reader(upstream, pkg))).needed, true);
+  assert.equal((await checkRelease(options, reader(upstream, null))).needed, true);
 });
 
 test('manual force runs unchanged Himalaya but schedule cannot force', async () => {
@@ -72,6 +71,8 @@ test('selected release is fixed and upstream/registry failures remain explicit',
 test('malformed adapter latest, corrupt identity and rollbacks fail even with force', async () => {
   for (const pkg of [
     { ...published, name: 'wrong' },
+    { ...published, version: '0.0.0-stage' },
+    { ...published, version: '1.0.0' },
     { ...published, version: '2.2.1-adapter.0.1.1-beta' },
     { ...published, version: '2.2.2-adapter.0.1.0' },
   ])
