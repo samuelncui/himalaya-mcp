@@ -60,10 +60,16 @@ export interface Manifest {
 }
 
 export interface CallInput {
+  [argument: string]: unknown;
   params?: Record<string, unknown>;
-  stdin?: string;
-  stdinBase64?: string;
-  files?: { name: string; base64: string }[];
+}
+
+/** A host-authorized file reference; its URL is a temporary capability, never a log value. */
+export interface OpenAIFile {
+  download_url: string;
+  file_id: string;
+  mime_type?: string;
+  file_name?: string;
 }
 
 export interface Artifact {
@@ -90,6 +96,8 @@ export interface Profiles {
     idempotent?: boolean;
     destructive?: boolean;
     interactive?: boolean;
+    requiresBackend?: string;
+    capabilityProbe?: boolean;
     args?: Record<string, IoRole>;
     pathExpansion?: Record<string, 'shell'>;
   }[];
@@ -107,13 +115,19 @@ export interface Policy {
 export interface ToolDefinition {
   name: string;
   description: string;
-  inputSchema: { type: 'object'; properties: Record<string, unknown>; additionalProperties: false };
+  inputSchema: {
+    type: 'object';
+    properties: Record<string, unknown>;
+    additionalProperties: false;
+    required?: string[];
+  };
   annotations: {
     readOnlyHint: boolean;
     destructiveHint: boolean;
     idempotentHint: boolean;
     openWorldHint: boolean;
   };
+  _meta?: { 'openai/fileParams': string[] };
 }
 
 export interface RunResult {
@@ -124,6 +138,31 @@ export interface RunResult {
   files: Artifact[];
   timedOut?: boolean;
 }
+
+export interface OperationRecord {
+  id: string;
+  tool: string;
+  state: 'accepted' | 'executing' | 'succeeded' | 'not_executed' | 'unknown';
+  createdAt: string;
+  updatedAt: string;
+  inputSha256: string;
+  error?: string;
+  exitCode?: number | null;
+  timedOut?: boolean;
+}
+
+export interface OperationResponse {
+  operation: OperationRecord;
+  summary: string;
+  result?: RunResult;
+  resultUnavailable?: string;
+}
+
+export interface OperationListResponse {
+  operations: OperationRecord[];
+}
+
+export type McpCallResult = RunResult | OperationResponse | OperationListResponse;
 
 export class AdapterError extends Error {
   constructor(

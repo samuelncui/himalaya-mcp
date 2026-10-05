@@ -1,9 +1,10 @@
 /** Real original-binary email verification, exclusively against a loopback sink. */
 import assert from 'node:assert/strict';
 import { createServer } from 'node:net';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
@@ -71,31 +72,55 @@ export async function smtpSmoke({ cli, catalog, environment = process.env, cache
       server.listen(0, '127.0.0.1', accept);
     });
     const config = join(directory, 'synthetic$HIMALAYA_MCP_FIXTURE_UNSET.toml');
+    const root = join(directory, 'local-account');
+    for (const part of ['new', 'cur', 'tmp'])
+      await mkdir(join(root, 'INBOX', part), { recursive: true });
+    const privateFile = join(directory, 'private-fixture.eml');
+    await writeFile(
+      privateFile,
+      'Subject: synthetic private file\r\n\r\nMust not be returned over MCP.\r\n',
+    );
+    for (const [index, date] of [
+      'Mon, 05 Oct 2026 00:30:00 +0800',
+      'Tue, 06 Oct 2026 00:30:00 +0800',
+    ].entries())
+      await writeFile(
+        join(root, 'INBOX', 'new', 'synthetic-date-' + index),
+        `From: sender@example.invalid\r\nTo: target@example.invalid\r\nDate: ${date}\r\nSubject: synthetic-date-${index}\r\n\r\nSynthetic date fixture\r\n`,
+      );
+    const importedInputs = join(directory, 'file-inputs.json');
     await writeFile(
       config,
-      `[accounts.fixture]\ndefault = true\nemail = "sender@example.invalid"\nsmtp.server = "smtp://127.0.0.1:${server.address().port}"\nsmtp.starttls = false\nmessage.send.backend = "smtp"\n`,
+      `[accounts.fixture]\ndefault = true\nemail = "sender@example.invalid"\nsmtp.server = "smtp://127.0.0.1:${server.address().port}"\nsmtp.starttls = false\nmessage.send.backend = "smtp"\n[accounts.local]\nemail = "local@example.invalid"\nmaildir.root = ${JSON.stringify(root)}\nmbox.root = ${JSON.stringify(root)}\n`,
       { mode: 0o600 },
     );
     transport = new StdioClientTransport({
       command: process.execPath,
       args: [
+        '--import',
+        pathToFileURL(join(import.meta.dirname, 'file-import-fixture.mjs')).href,
         cli,
         '--config',
         config,
         '--workspace-dir',
         join(directory, 'calls'),
+        '--operation-dir',
+        join(directory, 'operations'),
         '--cache-dir',
         cacheDir ?? environment.HIMALAYA_MCP_SMOKE_CACHE ?? join(directory, 'cache'),
       ],
-      env: Object.fromEntries(
-        Object.entries(environment).filter(
-          ([key, value]) =>
-            typeof value === 'string' &&
-            !['all_proxy', 'https_proxy', 'http_proxy', 'himalaya_config'].includes(
-              key.toLowerCase(),
-            ),
+      env: {
+        HIMALAYA_MCP_TEST_INPUTS: importedInputs,
+        ...Object.fromEntries(
+          Object.entries(environment).filter(
+            ([key, value]) =>
+              typeof value === 'string' &&
+              !['all_proxy', 'https_proxy', 'http_proxy', 'himalaya_config'].includes(
+                key.toLowerCase(),
+              ),
+          ),
         ),
-      ),
+      },
       stderr: 'pipe',
     });
     let logs = '';
@@ -104,6 +129,18 @@ export async function smtpSmoke({ cli, catalog, environment = process.env, cache
     });
     client = new Client({ name: 'himalaya-mcp-synthetic-mail-check', version: '1.0.0' });
     await client.connect(transport);
+    const tools = (await client.listTools()).tools;
+    const composeTool = tools.find((tool) => tool.name === 'himalaya_message_compose');
+    assert(
+      composeTool?._meta?.['openai/fileParams'].includes('attach'),
+      'Packed tool must advertise native attachment uploads',
+    );
+    const sendTool = tools.find((tool) => tool.name === 'himalaya_message_send');
+    assert(
+      sendTool?._meta?.['openai/fileParams'].includes('message-raw'),
+      'Packed tool must advertise raw file uploads',
+    );
+    let sequence = 0;
     const call = async (path, args) => {
       const command = catalog.commands.find(
         (command) => command.runnable && command.path.join(' ') === path,
@@ -111,14 +148,28 @@ export async function smtpSmoke({ cli, catalog, environment = process.env, cache
       assert(command, `Missing registered email command: ${path}`);
       const result = await client.callTool({
         name: ['himalaya', ...command.path].join('_'),
-        arguments: args,
+        arguments: { request_id: 'synthetic-request-' + ++sequence, ...args },
       });
       assert.equal(
         result.isError,
         false,
         `${path} failed: ${JSON.stringify(result.content)} ${logs}`,
       );
-      const output = result.structuredContent ?? JSON.parse(result.content[0].text);
+      let response = result.structuredContent ?? JSON.parse(result.content[0].text);
+      const deadline = Date.now() + 10_000;
+      while (
+        ['accepted', 'executing'].includes(response.operation?.state) &&
+        Date.now() < deadline
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        const status = await client.callTool({
+          name: 'himalaya_mcp_operation_status',
+          arguments: { id: response.operation.id },
+        });
+        response = status.structuredContent;
+      }
+      assert.equal(response.operation?.state, 'succeeded', JSON.stringify(response));
+      const output = response.result;
       assert.equal(output.exitCode, 0, `Native ${path} status`);
       return output;
     };
@@ -164,13 +215,28 @@ export async function smtpSmoke({ cli, catalog, environment = process.env, cache
       '--mixed--',
       '',
     ].join('\r\n');
+    await writeFile(
+      importedInputs,
+      JSON.stringify({
+        '/original.bin': encoded,
+        '/original.eml': Buffer.from(raw).toString('base64'),
+        '/literal.eml': Buffer.from(
+          'From: sender@example.invalid\r\nTo: visible@example.invalid\r\nSubject: Synthetic input\r\n\r\nLiteral ${HIMALAYA_MCP_FIXTURE_UNSET:-text} and $$ text\r\n',
+        ).toString('base64'),
+      }),
+    );
+    const ref = (pathname, name) => ({
+      download_url: 'https://packed-file-fixture.example.invalid' + pathname,
+      file_id: 'fixture-' + name,
+      file_name: name,
+    });
     await call('smtp send', {
       params: {
         account_name: 'fixture',
         mail_from: 'sender@example.invalid',
         rcpt_to: ['visible@example.invalid', 'hidden@example.invalid'],
       },
-      stdin: raw,
+      'message-raw': ref('/original.eml', 'smtp.eml'),
     });
     assert.equal(messages.length, 1);
     assert.equal(messages[0].recipients.length, 2);
@@ -188,8 +254,8 @@ export async function smtpSmoke({ cli, catalog, environment = process.env, cache
     );
     const uploadedName = 'synthetic${HIMALAYA_MCP_FIXTURE_UNSET}.eml';
     await call('message send', {
-      params: { account_name: 'fixture', no_save: true, 'message-raw': ['file:' + uploadedName] },
-      files: [{ name: uploadedName, base64: Buffer.from(raw).toString('base64') }],
+      params: { account_name: 'fixture', no_save: true },
+      'message-raw': ref('/original.eml', uploadedName),
     });
     assert.equal(messages.length, 2);
     assert.equal(messages[1].recipients.length, 3);
@@ -205,11 +271,10 @@ export async function smtpSmoke({ cli, catalog, environment = process.env, cache
         bcc: ['hidden@example.invalid'],
         subject: 'Synthetic attachment',
         body: 'Synthetic body',
-        attach: ['file:synthetic$HIMALAYA_MCP_FIXTURE_UNSET.bin'],
         no_save: true,
         send: true,
       },
-      files: [{ name: 'synthetic$HIMALAYA_MCP_FIXTURE_UNSET.bin', base64: encoded }],
+      attach: [ref('/original.bin', 'synthetic$HIMALAYA_MCP_FIXTURE_UNSET.bin')],
     });
     assert.equal(messages.length, 3);
     assert.equal(messages[2].recipients.length, 3);
@@ -226,10 +291,8 @@ export async function smtpSmoke({ cli, catalog, environment = process.env, cache
         account_name: 'fixture',
         mail_from: 'sender@example.invalid',
         rcpt_to: ['visible@example.invalid'],
-        'message-raw': [
-          'From: sender@example.invalid\r\nTo: visible@example.invalid\r\nSubject: Synthetic inline input\r\n\r\nLiteral ${HIMALAYA_MCP_FIXTURE_UNSET:-text} and $$ text\r\n',
-        ],
       },
+      'message-raw': ref('/literal.eml', 'literal.eml'),
     });
     assert.equal(messages.length, 4);
     assert(
@@ -242,8 +305,93 @@ export async function smtpSmoke({ cli, catalog, environment = process.env, cache
     });
     assert(completion.files.some((file) => file.name.startsWith('generated$literal/')));
     assert(completion.files.some((file) => file.name === 'log$literal.txt'));
+    await call('message compose', {
+      params: {
+        account_name: 'fixture',
+        to: ['visible@example.invalid'],
+        subject: 'Structured imported attachment',
+        body: 'Original bytes',
+        no_save: true,
+        send: true,
+      },
+      attach: [ref('/original.bin', 'imported-original.bin')],
+    });
+    assert.equal(messages.length, 5);
+    assert(
+      messages[4].data.toString().includes(encoded),
+      'File-object attachment lost original bytes',
+    );
+    assert(
+      messages[4].data.toString().includes('imported-original.bin'),
+      'File-object attachment filename missing',
+    );
+    await call('message send', {
+      params: { account_name: 'fixture', no_save: true },
+      'message-raw': ref('/original.eml', 'imported-original.eml'),
+    });
+    assert.equal(messages.length, 6);
+    assert(
+      messages[5].data.toString().includes('multipart/related'),
+      'File-object raw MIME was not forwarded',
+    );
+    assert(
+      messages[5].data.toString().includes(encoded),
+      'File-object raw MIME attachment missing',
+    );
+    const searchDate = async (query) =>
+      JSON.parse(
+        (
+          await call('envelope search', {
+            params: {
+              account_name: 'local',
+              backend: 'maildir',
+              inner: 'INBOX',
+              json: true,
+              query,
+            },
+          })
+        ).stdout,
+      )
+        .envelopes.map((envelope) => envelope.subject)
+        .sort();
+    assert.deepEqual(await searchDate(['date', '2026-10-05']), ['synthetic-date-0']);
+    assert.deepEqual(await searchDate(['after', '2026-10-05']), ['synthetic-date-1']);
+    assert.deepEqual(await searchDate(['date', '2026-10-05', 'or', 'after', '2026-10-05']), [
+      'synthetic-date-0',
+      'synthetic-date-1',
+    ]);
+    const remainingCalls = await readdir(join(directory, 'calls'));
+    assert.equal(
+      remainingCalls.length,
+      1,
+      'Only completion output artifacts may remain, not mail input files',
+    );
+    const blocked = await client.callTool({
+      name: 'himalaya_message_read',
+      arguments: {
+        request_id: 'boundary-maildir-request',
+        params: {
+          account_name: 'local',
+          backend: 'maildir',
+          id: '../../../../private-fixture.eml',
+          raw: true,
+        },
+      },
+    });
+    assert.equal(blocked.isError, true);
+    assert.match(JSON.stringify(blocked), /file_boundary/);
+    assert(!JSON.stringify(blocked).includes('Must not be returned'), 'Local file bytes leaked');
+    const blockedMbox = await client.callTool({
+      name: 'himalaya_mbox_message_save',
+      arguments: {
+        request_id: 'boundary-mbox-request',
+        params: { account_name: 'local', mbox_source_path: privateFile },
+      },
+    });
+    assert.equal(blockedMbox.isError, true);
+    assert.match(JSON.stringify(blockedMbox), /file_boundary/);
     console.error(
-      'Verified original Himalaya via packed MCP: raw nested MIME, shared send/Bcc, composed binary attachment, and literal inline input; 4 deliveries captured only on loopback.',
+      'Verified packed MCP with original Himalaya: MIME, Bcc, file-object attachments/raw mail, durable receipts, input cleanup and host-path rejection; HTTPS fixture transport mocked, 6 deliveries captured only on loopback.',
     );
   } finally {
     await client?.close();

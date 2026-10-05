@@ -58,7 +58,7 @@ function argumentSchema(arg: CliArg, role?: IoRole): Record<string, unknown> {
       : role === 'accountPath'
         ? 'Relative to the configured account root. Absolute paths and parent traversal are not accepted.'
         : arg.valueType === 'path'
-          ? 'Use a file:<uploaded-name> reference or a path within this call workspace.'
+          ? 'Call-scoped destination or native logical path only; native Help does not grant host filesystem access.'
           : '',
   ]
     .filter(Boolean)
@@ -92,6 +92,74 @@ function valuesSchema(arg: CliArg, item: Record<string, unknown>): Record<string
   };
 }
 
+export interface FileParameter {
+  argument: CliArg;
+  multiple: boolean;
+  nativeArray: boolean;
+}
+
+/** Derive upload bindings from factual I/O roles, never from command or parameter names. */
+export function fileParameters(command: CliCommand, profiles: Profiles): FileParameter[] {
+  const profile = commandProfile(command, profiles);
+  const fields: FileParameter[] = [];
+  const seen = new Set<string>(['params']);
+  for (const argument of command.args) {
+    const role = profile.args?.[argument.id];
+    if (role !== 'inputFile' && role !== 'inlineOrFile') continue;
+    if (seen.has(argument.id))
+      throw new AdapterError(
+        'definition_file',
+        `File field ${argument.id} collides with another input in ${command.path.join(' ')}.`,
+        'Update the generator or factual profile; do not omit this command.',
+      );
+    seen.add(argument.id);
+    const schema = argumentSchema(argument);
+    const nativeArray = schema.type === 'array';
+    if (nativeArray && (schema.items as Record<string, unknown>).type === 'array')
+      throw new AdapterError(
+        'definition_file',
+        `File field ${argument.id} in ${command.path.join(' ')} has unsupported grouped arrays.`,
+        'Extend the generic file binding before publishing this CLI definition.',
+      );
+    fields.push({ argument, nativeArray, multiple: role !== 'inlineOrFile' && nativeArray });
+  }
+  return fields;
+}
+
+function fileSchema(field: FileParameter): Record<string, unknown> {
+  const item = {
+    type: 'object',
+    properties: {
+      download_url: {
+        type: 'string',
+        description:
+          'Temporary public HTTPS download URL supplied by the client; private network destinations are rejected.',
+      },
+      file_id: {
+        type: 'string',
+        description: 'Client file identifier; the server downloads through download_url.',
+      },
+      mime_type: { type: 'string', description: 'Optional client-declared MIME type.' },
+      file_name: {
+        type: 'string',
+        description:
+          'Original basename to preserve the filename and extension; otherwise file_id becomes the filename.',
+      },
+    },
+    required: ['download_url', 'file_id'],
+    additionalProperties: false,
+  };
+  const description = `Client file reference for native argument ${JSON.stringify(field.argument.id)}. Supply file_id and download_url together; the server imports the complete file and binds its native path automatically. This argument is not accepted under params.`;
+  return field.multiple ? { type: 'array', items: item, description } : { ...item, description };
+}
+
+function fileInstructions(fields: FileParameter[]): string {
+  const direct = fields.length
+    ? `File inputs: ${fields.map(({ argument, multiple }) => `${argument.id} (${multiple ? 'file-object array' : 'file object'})`).join(', ')} are top-level fields, not params. Supply client file objects with file_id and download_url together; include file_name to preserve the original filename and extension. The server downloads and binds each complete file automatically.\n`
+    : 'This command has no generated input-file field.\n';
+  return `${direct}Use params for other structured native arguments. Follow the server's common instructions for file transfer, receipts and verification. Native Help below describes the CLI; its local-file and pipe examples are not MCP input channels.`;
+}
+
 export function buildTools(catalog: Catalog, profiles: Profiles): ToolDefinition[] {
   if (catalog.schemaVersion !== 1 || profiles.schemaVersion !== 1)
     throw new AdapterError('definition_version', 'Unsupported definition format.');
@@ -104,8 +172,12 @@ export function buildTools(catalog: Catalog, profiles: Profiles): ToolDefinition
         throw new AdapterError('tool_collision', `Generated tool name collision: ${name}`);
       seen.add(name);
       const profile = commandProfile(command, profiles);
+      const inputFiles = fileParameters(command, profiles);
+      const fileIds = new Set(inputFiles.map(({ argument }) => argument.id));
       const properties = Object.fromEntries(
-        command.args.map((arg) => [arg.id, argumentSchema(arg, profile.args?.[arg.id])]),
+        command.args
+          .filter((arg) => !fileIds.has(arg.id))
+          .map((arg) => [arg.id, argumentSchema(arg, profile.args?.[arg.id])]),
       );
       const writesFiles = command.args.some((arg) =>
         ['outputFile', 'outputDirectory'].includes(profile.args?.[arg.id] ?? ''),
@@ -113,30 +185,17 @@ export function buildTools(catalog: Catalog, profiles: Profiles): ToolDefinition
       const readOnly = !writesFiles && (profile.readOnly ?? false);
       return {
         name,
-        description: `${command.help}\n\n${profile.interactive ? 'This native command requires terminal interaction; the MCP process supplies stdin and EOF, not a terminal.\n' : ''}Use params for native arguments. Shared stdin/files do not implement a separate email API.`,
+        description: `${fileInstructions(inputFiles)}\n\n${command.help}`,
+        ...(inputFiles.length
+          ? { _meta: { 'openai/fileParams': inputFiles.map(({ argument }) => argument.id) } }
+          : {}),
         inputSchema: {
           type: 'object',
           properties: {
+            ...Object.fromEntries(
+              inputFiles.map((field) => [field.argument.id, fileSchema(field)]),
+            ),
             params: { type: 'object', properties, additionalProperties: false },
-            stdin: {
-              type: 'string',
-              description: 'UTF-8 stdin; mutually exclusive with stdinBase64.',
-            },
-            stdinBase64: {
-              type: 'string',
-              description: 'Base64-encoded stdin bytes; mutually exclusive with stdin.',
-            },
-            files: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: { name: { type: 'string' }, base64: { type: 'string' } },
-                required: ['name', 'base64'],
-                additionalProperties: false,
-              },
-              description:
-                'Upload synthetic or user-provided files. Reference each as file:<name> in a path argument.',
-            },
           },
           additionalProperties: false,
         },

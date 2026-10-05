@@ -24,10 +24,12 @@ Pin an available release in your MCP client:
       "command": "npx",
       "args": [
         "--yes",
-        "himalaya-mcp@2.2.1-adapter.0.1.2",
+        "himalaya-mcp@2.2.1-adapter.0.1.3",
         "serve",
         "--config",
-        "/absolute/path/to/config.toml"
+        "/absolute/path/to/config.toml",
+        "--operation-dir",
+        "/absolute/private/path/to/operations"
       ]
     }
   }
@@ -56,9 +58,19 @@ The endpoint is `http://127.0.0.1:3000/mcp`. HTTP has Host/Origin checks, **no b
 
 ## Calling tools
 
-Tools accept generated `params` plus optional `stdin`, `stdinBase64`, and uploaded `files`. Results preserve native exit status and stdout/stderr; generated files are exposed as MCP resources. RFC822/MIME and attachment handling stay with Himalaya. See [the call contract](docs/usage.md) for shapes, file boundaries, and limits.
+The MCP server provides common file and send-verification instructions during initialization, separate from automatically exported native Help. Clients should apply those instructions together with each tool schema.
 
-An optional, personally maintained YAML policy excludes operations you choose. It is never installed automatically; sending and attachments are not excluded by the supplied example. MCP annotations describe effects and do not prove approval. Read [policy behavior](docs/policy.md) before enabling `--policy`.
+Every native call requires a unique, stable `request_id`. The server saves an operation receipt before execution; a slow call returns its ID after approximately two seconds while execution continues. Use `himalaya_mcp_operation_status` or `himalaya_mcp_operations_list` after a lost response. Identical requests reuse the retained receipt rather than executing again; changed inputs under the same ID are rejected. Deduplication is bounded by history retention (up to 24 hours / 128 records). Missing history, interrupted results, or `unknown` never justify automatic resending. Native exit 0 confirms completion or backend acceptance for sending, not recipient delivery.
+
+`--operation-dir` selects private persistent metadata; raw inputs, URLs, and email content are not saved. Full output is temporary in-memory data. Use one directory per live server, including separate diagnostic instances. A live PID owner blocks concurrent startup; recovered incomplete operations remain `unknown` without replay. See [the operation and file contract](docs/usage.md).
+
+Tools accept structured native `params` plus generated top-level file fields such as `attach`. Declared file arguments are not duplicated under `params`. A file field takes client objects containing `file_id` and `download_url`, identified through `openai/fileParams` metadata. The generic runtime imports each complete file and binds it to the original CLI. Shared byte uploads, stdin mail inputs, and inline raw-mail inputs have been removed from the public API.
+
+A compatible client's file forwarding is required; a file ID alone, client path, or resource URI is not an input. If that channel is missing, report the client limitation without reconstructing files or trying workspace transfers. Complete raw mail is imported as one `.eml` object. Operation responses preserve available native exit status and stdout/stderr, and output resources allow retrieval without promising automatic re-input. See [the file contract](docs/usage.md) for schemas, limits, and client verification.
+
+An optional, personally maintained YAML policy excludes operations you choose. It is never installed automatically; sending and attachments are not excluded by the supplied example. Runtime tool availability filtering hides wholly excluded and terminal-only commands; conditional exclusions are checked on each call. Read [policy behavior](docs/policy.md) before enabling `--policy`. Annotations describe effects and do not prove approval.
+
+The generated schema and server-side bridge do not establish that a live ChatGPT connection forwards files correctly; real client acceptance must be verified separately.
 
 The release manifest targets macOS arm64/x64, Linux arm64/x64, and Windows x64. Actual platform results belong to CI and release artifacts; a target listed here is not a claim that it has been tested successfully.
 

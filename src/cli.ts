@@ -2,12 +2,14 @@
 import { createHash } from 'node:crypto';
 import { constants, realpathSync } from 'node:fs';
 import { access, readFile, stat } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ensureBinary, inspectBinary } from './binary.js';
 import { buildTools } from './catalog.js';
 import { errorMessage, startHttp, startStdio, type RunningServer } from './mcp.js';
+import { OperationRuntime } from './operations.js';
 import { loadPolicy } from './policy.js';
 import { Runtime } from './runtime.js';
 import { AdapterError, type Catalog, type Manifest, type Profiles } from './types.js';
@@ -23,6 +25,7 @@ export interface CliOptions {
   policy?: string;
   cacheDir?: string;
   workspaceDir?: string;
+  operationDir?: string;
 }
 
 const HELP = `Usage: himalaya-mcp [serve | doctor | describe] [options]
@@ -41,12 +44,13 @@ Options:
   --policy PATH          Load your optional dangerous-operation policy
   --cache-dir PATH       Binary download cache
   --workspace-dir PATH   Parent directory for private call workspaces
+  --operation-dir PATH   Private persistent execution receipts (one server owner)
   --json                 JSON output for doctor or describe
   --help                 Show this Help
   --version              Show the adapter version
 
 HTTP serves /mcp. It has no built-in user authentication; its deployment owns access.
-MCP inputs use generated params plus optional stdin/stdinBase64/files, never shell argv.
+MCP inputs use request_id, generated params and declared file objects, never shell argv.
 `;
 
 export function parseOptions(argv: string[]): CliOptions {
@@ -65,6 +69,7 @@ export function parseOptions(argv: string[]): CliOptions {
         policy: { type: 'string' },
         'cache-dir': { type: 'string' },
         'workspace-dir': { type: 'string' },
+        'operation-dir': { type: 'string' },
         json: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
@@ -117,6 +122,9 @@ export function parseOptions(argv: string[]): CliOptions {
     ...(values['workspace-dir'] === undefined
       ? {}
       : { workspaceDir: resolve(values['workspace-dir']) }),
+    ...(values['operation-dir'] === undefined
+      ? {}
+      : { operationDir: resolve(values['operation-dir']) }),
   };
 }
 
@@ -219,10 +227,11 @@ async function doctor(
   };
 }
 
-/** Exported for CLI tests; no command automatically accesses a mailbox. */
+/** Exported for CLI tests; doctor/describe never access a mailbox. */
 export async function runCli(argv: string[], directory?: URL): Promise<number> {
   let options: CliOptions | undefined;
   let runtime: Runtime | undefined;
+  let operations: OperationRuntime | undefined;
   let running: RunningServer | undefined;
   try {
     options = parseOptions(argv);
@@ -266,14 +275,30 @@ export async function runCli(argv: string[], directory?: URL): Promise<number> {
       ...(options.policy === undefined ? {} : { policyPath: options.policy }),
       ...(options.workspaceDir === undefined ? {} : { workspaceRoot: options.workspaceDir }),
     });
+    await runtime.discoverBackends();
+    const configIdentity =
+      options.config ??
+      process.env.HIMALAYA_CONFIG ??
+      join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'himalaya');
+    operations = new OperationRuntime(runtime, {
+      directory:
+        options.operationDir ??
+        join(
+          process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'),
+          'himalaya-mcp',
+          'operations',
+          createHash('sha256').update(configIdentity).digest('hex'),
+        ),
+    });
+    await operations.ready();
     running =
       options.transport === 'http'
-        ? await startHttp(runtime, {
+        ? await startHttp(operations, {
             version: bundle.manifest.packageVersion,
             host: options.host,
             port: options.port,
           })
-        : startStdio(runtime, { version: bundle.manifest.packageVersion });
+        : startStdio(operations, { version: bundle.manifest.packageVersion });
     if (running.url) process.stderr.write(`Himalaya MCP listening at ${running.url}\n`);
     const stop = (): void => {
       void running?.close().catch(() => undefined);
@@ -298,6 +323,10 @@ export async function runCli(argv: string[], directory?: URL): Promise<number> {
   } finally {
     // An owned server reports its closing failure through done, which the catch above handles.
     if (running) await running.close().catch(() => undefined);
+    else if (operations)
+      await operations.close().catch(() => {
+        process.stderr.write('Execution receipt cleanup failed.\n');
+      });
     else if (runtime)
       await runtime.close().catch(() => {
         process.stderr.write('Native workspace cleanup failed.\n');

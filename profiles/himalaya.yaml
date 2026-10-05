@@ -1,6 +1,32 @@
 # Factual supplements only. This file does not select which commands exist.
 schemaVersion: 1
 rules:
+  # Native namespace dispatch requires a configured backend before its handler.
+  - commands: ['imap **']
+    requiresBackend: imap
+  - commands: ['smtp **']
+    requiresBackend: smtp
+  - commands: ['jmap **']
+    requiresBackend: jmap
+  - commands: ['gmail **']
+    requiresBackend: gmail
+  - commands: ['msgraph **']
+    requiresBackend: msgraph
+  - commands: ['sieve **']
+    requiresBackend: sieve
+  - commands: ['maildir **']
+    requiresBackend: maildir
+  - commands: ['mbox **']
+    requiresBackend: mbox
+  - commands: ['pimdir **']
+    requiresBackend: pimdir
+  # 2.2.1 account list omits Pimdir. A local read-only queue query proves its
+  # configured store is usable without parsing credentials or connecting mail.
+  - commands: ['pimdir queue list']
+    capabilityProbe: true
+    readOnly: true
+    destructive: false
+    idempotent: true
   - commands: ['**']
     pathExpansion:
       log-file: shell
@@ -15,6 +41,52 @@ rules:
       maildir_path: accountPath
       maildir_source_path: accountPath
       maildir_target_path: accountPath
+  # Local backends interpret these String arguments as filesystem selectors too.
+  - commands: ['maildir **']
+    args:
+      maildir_name: accountPath
+      message_ids: accountPath
+  - commands: ['mbox **']
+    args:
+      mbox_path: accountPath
+      mbox_source_path: accountPath
+      mbox_target_path: accountPath
+      mbox_name: accountPath
+  # Shared selectors may route to local backends. Preserve opaque IDs (including
+  # slashes), but prohibit absolute paths and parent traversal for every backend.
+  - commands:
+      [
+        'envelope list',
+        'envelope search',
+        'flag *',
+        'message read',
+        'message reply',
+        'message forward',
+        'message delete',
+        'attachment list',
+        'attachment download',
+      ]
+    args:
+      inner: accountPath
+  - commands: ['message add']
+    args:
+      mailbox: accountPath
+  - commands: ['message copy', 'message move']
+    args:
+      from: accountPath
+      to: accountPath
+  - commands: ['message compose', 'message reply', 'message forward', 'message send']
+    args:
+      save: accountPath
+  - commands: ['message read', 'message reply', 'message forward']
+    args:
+      id: accountPath
+  - commands: ['flag *', 'message copy', 'message move', 'message delete']
+    args:
+      message_ids: accountPath
+  - commands: ['attachment list', 'attachment download']
+    args:
+      message_id: accountPath
   - commands: ['attachment download', 'completion', 'manual', 'json-schema']
     args:
       dir: outputDirectory
