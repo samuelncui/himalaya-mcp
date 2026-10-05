@@ -1,0 +1,115 @@
+[
+  {
+    "name": "compose repeat recipients and attachments",
+    "path": ["message", "compose"],
+    "params": {
+      "to": ["a@example.invalid", "b@example.invalid"],
+      "cc": ["c@example.invalid"],
+      "bcc": ["d@example.invalid"],
+      "attach": ["$FIXTURE/attachment.txt", "$FIXTURE/attachment unicode.txt"],
+      "subject": "--account=intruder",
+      "body": "quotes \" ' $() & ;\n第二行",
+      "send": true,
+      "no_save": true
+    }
+  },
+  {
+    "name": "repeat Gmail headers",
+    "path": ["gmail", "messages", "get"],
+    "params": {
+      "id": "synthetic-message",
+      "headers": ["Subject", "From"],
+      "format": "metadata"
+    }
+  },
+  {
+    "name": "trailing search query",
+    "path": ["envelope", "search"],
+    "params": {
+      "page": 2,
+      "page_size": 10,
+      "query": ["subject", "--account=intruder", "and", "body", "unicode 邮件"]
+    }
+  },
+  {
+    "name": "multi-value append option before UID positional",
+    "path": ["imap", "store"],
+    "params": {
+      "sequence_set": "1:3",
+      "action": "add",
+      "flag": [["\\Seen", "custom"], ["\\Flagged"]],
+      "seq": false
+    }
+  },
+  {
+    "name": "ordinary mailbox before raw last positional",
+    "path": ["imap", "append"],
+    "params": {
+      "mailbox_name": "Synthetic Inbox",
+      "flag": [["\\Seen"]],
+      "message-raw": ["Subject: synthetic\r\n\r\nbody"]
+    }
+  },
+  {
+    "name": "explicit zero-value flag occurrence",
+    "path": ["imap", "append"],
+    "params": {
+      "mailbox_name": "Synthetic Inbox",
+      "flag": [[]],
+      "message-raw": ["$FIXTURE/message.eml"]
+    }
+  },
+  {
+    "name": "SMTP custom parsers and repeat recipients",
+    "path": ["smtp", "send"],
+    "params": {
+      "mail_from": "",
+      "rcpt_to": ["a@example.invalid", "b@example.invalid"],
+      "message-raw": ["Subject: synthetic\r\n\r\nbody"]
+    }
+  },
+  {
+    "name": "value-taking boolean and numeric bound",
+    "path": ["gmail", "settings", "imap", "set"],
+    "params": {
+      "auto_expunge": false,
+      "max_folder_size": 1000
+    }
+  },
+  {
+    "name": "JMAP ordered content in a single trailing field",
+    "path": ["jmap", "query"],
+    "params": {
+      "using": ["urn:ietf:params:jmap:core"],
+      "method-calls": ["[[\"Core/echo\",", "{\"name\":\"synthetic\"},", "\"a\"]]"]
+    }
+  },
+  {
+    "name": "native conflict remains authoritative",
+    "path": ["message", "compose"],
+    "params": {
+      "body": "inline",
+      "body_file": "$FIXTURE/body.txt"
+    },
+    "errorKind": "ArgumentConflict"
+  },
+  {
+    "name": "native opaque parser rejects invalid SMTP address",
+    "path": ["smtp", "send"],
+    "params": {
+      "mail_from": "not-an-address",
+      "rcpt_to": ["a@example.invalid"]
+    },
+    "errorKind": "ValueValidation"
+  },
+  {
+    "name": "native enum rejects unknown value",
+    "path": ["imap", "store"],
+    "params": {
+      "sequence_set": "1",
+      "flag": [["\\Seen"]],
+      "action": "unknown"
+    },
+    "errorKind": "InvalidValue"
+  }
+]

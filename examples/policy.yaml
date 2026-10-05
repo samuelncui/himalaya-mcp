@@ -1,0 +1,9 @@
+# Opt-in example for Himalaya 2.2.1; never loaded or installed automatically.
+# Keep only operations you personally intend to exclude. Each entry is your
+# own authorization boundary. Sending and moving to Trash are not excluded.
+schemaVersion: 1
+deny:
+  - command: imap expunge
+    reason: Permanently removes messages already marked Deleted.
+  - command: gmail messages delete
+    reason: Permanently deletes a Gmail message instead of moving it to Trash.

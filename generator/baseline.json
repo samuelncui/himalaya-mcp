@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "version": "2.2.1",
+  "tag": "v2.2.1",
+  "revision": "5b12b2a8c2c253b98f15c46610ad74cba2a182bc",
+  "cargoLockSha256": "a59d0d58a2df9072d5e740e4227fdb4784a5fc23bfb7e4d455073eaedcc87e31",
+  "features": [
+    "gmail",
+    "imap",
+    "jmap",
+    "maildir",
+    "mbox",
+    "msgraph",
+    "pimdir",
+    "rustls-ring",
+    "sieve",
+    "smtp"
+  ]
+}

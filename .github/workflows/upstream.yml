@@ -1,0 +1,217 @@
+name: Upstream release
+on:
+  schedule:
+    - cron: '17 1 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Stable Himalaya X.Y.Z; empty selects the latest official release'
+        type: string
+        required: false
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: himalaya-npm-release
+  cancel-in-progress: false
+
+jobs:
+  generation:
+    if: github.ref == 'refs/heads/main' && github.repository == 'samuelncui/himalaya-mcp'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      NODE_OPTIONS: --use-system-ca
+      UPSTREAM_VERSION: ${{ inputs.version }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install build tools for source reflection only
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config libsqlite3-dev
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Resolve fresh official source and all five assets
+        run: node scripts/release.mjs prepare
+      - run: node scripts/upstream.mjs generate --lock build/generated/upstream.lock.json
+      - run: npm run check
+      - run: npm run verify:native
+      - run: node scripts/release.mjs check-source
+      - name: Export data-only definitions and original source evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-definitions
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            build/generated/catalog.json
+            build/generated/manifest.json
+            build/generated/upstream.lock.json
+            build/generated/verification.json
+            build/generated/syntax-report.json
+            build/generated/catalog-diff.json
+            build/downloads/source-*.tgz
+            build/upstream/*/Cargo.lock
+            build/release/plan.json
+      - name: Keep failed compatibility reports for diagnosis
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-failure-reports
+          if-no-files-found: ignore
+          retention-days: 30
+          path: |
+            build/generated/syntax-report.json
+            build/generated/catalog-diff.json
+            build/generated/verification.json
+            build/release/plan.json
+
+  package:
+    needs: generation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      artifact-id: ${{ steps.seal.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-definitions
+          path: build
+      - name: Validate reviewed JS in a fresh VM
+        run: npm run check
+      - run: npm run build
+      - name: Assemble a versioned package without writing main
+        run: node scripts/release.mjs assemble
+      - name: Seal immutable release evidence before native smoke execution
+        id: seal
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-candidate
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            build/release/package.tgz
+            build/release/release.lock.json
+            build/release/himalaya-source.tgz
+            build/release/Cargo.lock
+            build/release/verification.json
+            build/release/syntax-report.json
+            build/release/catalog-diff.json
+      - name: Validate the exact candidate and loopback complex MIME/attachments
+        run: node scripts/smoke-pack.mjs --package build/release/package.tgz
+
+  platforms:
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+          - runner: macos-15-intel
+            platform: darwin
+            arch: x64
+          - runner: macos-15
+            platform: darwin
+            arch: arm64
+          - runner: windows-2025
+            platform: win32
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact-id }}
+          path: build/release
+          merge-multiple: true
+      - run: node scripts/release.mjs verify
+      - name: Install and exercise the same sealed archive on the declared native architecture
+        run: node scripts/platform-smoke.mjs --package build/release/package.tgz --expected-platform ${{ matrix.platform }} --expected-arch ${{ matrix.arch }}
+
+  publish:
+    needs: [package, platforms]
+    if: github.ref == 'refs/heads/main' && github.repository == 'samuelncui/himalaya-mcp' && vars.NPM_TRUSTED_PUBLISHING_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Pin the official npm CLI with OIDC dist-tag support, without install scripts
+        run: npm install --global npm@11.21.0 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact-id }}
+          path: build/release
+          merge-multiple: true
+      - name: Publish only the verified artifact; never run package code or lifecycle scripts
+        run: node scripts/release.mjs publish
+
+  github-release:
+    needs: [package, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact-id }}
+          path: build/release
+          merge-multiple: true
+      - name: Create or finish the matching GitHub Release and verify asset digests
+        run: node scripts/release.mjs github

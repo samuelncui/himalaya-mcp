@@ -1,0 +1,142 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      NODE_OPTIONS: --use-system-ca
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install build tools for source reflection only
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config libsqlite3-dev
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Generate the reviewed baseline
+        run: node scripts/upstream.mjs generate
+      - run: npm run check
+      - run: npm run verify:native
+      - name: Check adapter source was not changed by upstream build hooks
+        run: node scripts/release.mjs check-source
+      - name: Export data and source evidence, never the native parser helper
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: baseline-definitions
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            build/generated/catalog.json
+            build/generated/manifest.json
+            build/generated/upstream.lock.json
+            build/generated/verification.json
+            build/generated/syntax-report.json
+            build/generated/catalog-diff.json
+            build/downloads/source-*.tgz
+            build/upstream/*/Cargo.lock
+      - name: Keep failed compatibility reports for diagnosis
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: baseline-failure-reports
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            build/generated/syntax-report.json
+            build/generated/catalog-diff.json
+            build/generated/verification.json
+
+  package:
+    needs: generation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      artifact-id: ${{ steps.seal.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: baseline-definitions
+          path: build
+      - name: Validate reviewed JS in a fresh VM without Rust build hooks
+        run: npm run check
+      - run: npm run build
+      - run: node scripts/release.mjs check-source
+      - name: Pack without lifecycle scripts
+        run: node scripts/release.mjs pack-baseline
+      - name: Seal the package before running the downloaded native executable
+        id: seal
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: baseline-package
+          if-no-files-found: error
+          retention-days: 14
+          path: build/pack/package.tgz
+      - name: Validate this exact packed artifact and loopback mail behavior
+        run: node scripts/smoke-pack.mjs --package build/pack/package.tgz
+
+  platforms:
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+          - runner: macos-15-intel
+            platform: darwin
+            arch: x64
+          - runner: macos-15
+            platform: darwin
+            arch: arm64
+          - runner: windows-2025
+            platform: win32
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact-id }}
+          path: build/platform
+          merge-multiple: true
+      - name: Install and exercise the sealed npm archive on the declared native architecture
+        run: node scripts/platform-smoke.mjs --package build/platform/package.tgz --expected-platform ${{ matrix.platform }} --expected-arch ${{ matrix.arch }}

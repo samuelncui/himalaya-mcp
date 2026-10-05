@@ -1,0 +1,56 @@
+# Factual supplements only. This file does not select which commands exist.
+schemaVersion: 1
+rules:
+  - commands: ['**']
+    args:
+      config_paths: config
+      message-raw: inlineOrFile
+      attach: inputFile
+      body_file: inputFile
+      signature_file: inputFile
+      script_file: inputFile
+      log-file: outputFile
+      maildir_path: accountPath
+      maildir_source_path: accountPath
+      maildir_target_path: accountPath
+  - commands: ['attachment download', 'completion', 'manual', 'json-schema']
+    args:
+      dir: outputDirectory
+  - commands: ['gmail attachments get', 'msgraph attachments get']
+    args:
+      output: outputFile
+  - commands: ['msgraph attachments create']
+    args:
+      path: inputFile
+  - commands:
+      [
+        'account list',
+        'mailbox list',
+        'envelope list',
+        'envelope search',
+        'gmail messages get',
+        'gmail messages list',
+        'msgraph messages list',
+        'msgraph messages get',
+        'imap list',
+        'imap status',
+        'help **',
+      ]
+    readOnly: true
+    destructive: false
+    idempotent: true
+  # read --seen may write. One static annotation must cover all permitted modes.
+  - commands:
+      [
+        'message read',
+        'message compose',
+        'message send',
+        'message reply',
+        'message forward',
+        'smtp send',
+      ]
+    readOnly: false
+    destructive: true
+    idempotent: false
+  - commands: ['', 'configure', 'account configure']
+    interactive: true
